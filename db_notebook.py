@@ -1,61 +1,107 @@
-import os
+import time
 import aiosqlite
 from loguru import logger
 
 
-class DBNotebook:
+class NotebookDB:
 
-    def __init__(self, db_path: str):
-        self._db_path = db_path
-        self._db = None
+    def __init__(self, conn: aiosqlite.Connection):
+        self._conn = conn
+        conn.row_factory = aiosqlite.Row
 
-    async def init(self):
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._init_tables()
-        logger.info("db_notebook.ready")
-
-    async def _init_tables(self):
-        await self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS notebook (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                category TEXT DEFAULT 'general',
-                tags TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_notebook_category ON notebook(category);
-            CREATE INDEX IF NOT EXISTS idx_notebook_tags ON notebook(tags);
-        """)
-        await self._db.commit()
-
-    async def close(self):
-        if self._db:
-            await self._db.close()
-
-    async def add(self, title: str, content: str, category: str = "general", tags: str = "") -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO notebook (title, content, category, tags) VALUES (?, ?, ?, ?)",
-            (title, content, category, tags)
+    async def insert_notebook(self, kind: str, content: str, tags: str = "",
+                               importance: float = 0.5, due_date: float = 0) -> int:
+        now = time.time()
+        cursor = await self._conn.execute(
+            """INSERT INTO notebook_entries
+               (kind, content, tags, importance, due_date, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
+            (kind, content, tags, importance, due_date, now, now),
         )
-        await self._db.commit()
+        await self._conn.commit()
         return cursor.lastrowid
 
-    async def search(self, query: str, limit: int = 10) -> list:
-        cursor = await self._db.execute(
-            "SELECT id, title, content, category, tags, created_at FROM notebook WHERE title LIKE ? OR content LIKE ? ORDER BY updated_at DESC LIMIT ?",
-            (f"%{query}%", f"%{query}%", limit)
-        )
+    async def get_notebook_notes(self, kind: str | None = None, limit: int = 10) -> list[dict]:
+        if kind:
+            cursor = await self._conn.execute(
+                """SELECT * FROM notebook_entries
+                   WHERE kind=? AND status='active'
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (kind, limit),
+            )
+        else:
+            cursor = await self._conn.execute(
+                """SELECT * FROM notebook_entries
+                   WHERE status='active'
+                   ORDER BY updated_at DESC LIMIT ?""",
+                (limit,),
+            )
         rows = await cursor.fetchall()
-        return [{"id": r[0], "title": r[1], "content": r[2], "category": r[3], "tags": r[4], "created_at": r[5]} for r in rows]
+        return [dict(r) for r in rows]
 
-    async def get_all(self, limit: int = 50) -> list:
-        cursor = await self._db.execute(
-            "SELECT id, title, category, tags, created_at FROM notebook ORDER BY updated_at DESC LIMIT ?",
-            (limit,)
+    async def archive_notebook_entries(self, id_threshold: int = 0, kind: str | None = None):
+        if kind:
+            await self._conn.execute(
+                """UPDATE notebook_entries SET status='archived', updated_at=?
+                   WHERE kind=? AND status='active' AND id > ?""",
+                (time.time(), kind, id_threshold),
+            )
+        else:
+            await self._conn.execute(
+                """UPDATE notebook_entries SET status='archived', updated_at=?
+                   WHERE status='active' AND id > ?""",
+                (time.time(), id_threshold),
+            )
+        await self._conn.commit()
+
+    async def delete_notebook_entry(self, note_id: int) -> bool:
+        cursor = await self._conn.execute(
+            "UPDATE notebook_entries SET status='archived', updated_at=? WHERE id=?",
+            (time.time(), note_id),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
+
+    async def touch_notebook_entry(self, note_id: int) -> bool:
+        cursor = await self._conn.execute(
+            "UPDATE notebook_entries SET updated_at=? WHERE id=?",
+            (time.time(), note_id),
+        )
+        await self._conn.commit()
+        return cursor.rowcount > 0
+
+    async def get_due_tasks(self, window_seconds: int = 3600) -> list[dict]:
+        now = time.time()
+        cursor = await self._conn.execute(
+            """SELECT * FROM notebook_entries
+               WHERE kind='task' AND status='active'
+               AND due_date > 0 AND due_date <= ? AND due_date > ?
+               ORDER BY due_date ASC""",
+            (now, now - window_seconds),
         )
         rows = await cursor.fetchall()
-        return [{"id": r[0], "title": r[1], "category": r[2], "tags": r[3], "created_at": r[4]} for r in rows]
+        return [dict(r) for r in rows]
+
+    async def get_pending_tasks(self, limit: int = 20) -> list[dict]:
+        cursor = await self._conn.execute(
+            """SELECT * FROM notebook_entries
+               WHERE kind='task' AND status='active'
+               ORDER BY due_date ASC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def complete_task(self, task_id: int):
+        await self._conn.execute(
+            "UPDATE notebook_entries SET status='completed', updated_at=? WHERE id=?",
+            (time.time(), task_id),
+        )
+        await self._conn.commit()
+
+    async def cancel_task(self, task_id: int):
+        await self._conn.execute(
+            "UPDATE notebook_entries SET status='cancelled', updated_at=? WHERE id=?",
+            (time.time(), task_id),
+        )
+        await self._conn.commit()
