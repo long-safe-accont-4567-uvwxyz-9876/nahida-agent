@@ -48,23 +48,23 @@ _original_send_heart = BotWebSocket._send_heart
 
 async def _patched_send_heart(self, interval):
     _log = __import__("botpy.logging", fromlist=["get_logger"]).get_logger()
-    _log.info("[botpy] \u5fc3\u8df3\u7ef4\u6301\u542f\u52a8\uff08\u5e26\u8d85\u65f6\u68c0\u6d4b\uff09...")
+    _log.info("[botpy] 心跳维持启动（带超时检测）...")
     self._last_heartbeat_ack = asyncio.get_event_loop().time()
     missed_acks = 0
     while True:
         if self._conn is None:
-            _log.debug("[botpy] \u8fde\u63a5\u5df2\u5173\u95ed!")
+            _log.debug("[botpy] 连接已关闭!")
             return
         if self._conn.closed:
-            _log.debug("[botpy] ws\u8fde\u63a5\u5df2\u5173\u95ed, \u5fc3\u8df3\u68c0\u6d4b\u505c\u6b62")
+            _log.debug("[botpy] ws连接已关闭, 心跳检测停止")
             return
 
         now = asyncio.get_event_loop().time()
         if now - self._last_heartbeat_ack > interval * 2.5:
             missed_acks += 1
-            _log.warning(f"[botpy] \u5fc3\u8df3ACK\u8d85\u65f6 ({missed_acks}\u6b21), \u4e0a\u6b21ACK: {int(now - self._last_heartbeat_ack)}\u79d2\u524d")
+            _log.warning(f"[botpy] 心跳ACK超时 ({missed_acks}次), 上次ACK: {int(now - self._last_heartbeat_ack)}秒前")
             if missed_acks >= 2:
-                _log.warning("[botpy] \u5fc3\u8df3ACK\u8fde\u7eed\u8d85\u65f6\uff0c\u5f3a\u5236\u65ad\u5f00\u91cd\u8fde!")
+                _log.warning("[botpy] 心跳ACK连续超时，强制断开重连!")
                 await self._conn.close()
                 return
         else:
@@ -155,16 +155,16 @@ class AIQQBot(botpy.Client):
                 result = await self.agent.receive_file(att)
                 if result["status"] == "ok":
                     if result.get("text_preview"):
-                        parts.append(f"[\u6587\u4ef6: {fn}]\n\u5185\u5bb9\u9884\u89c8:\n{result['text_preview'][:500]}")
+                        parts.append(f"[文件: {fn}]\n内容预览:\n{result['text_preview'][:500]}")
                     else:
-                        parts.append(f"[\u6587\u4ef6: {fn}\uff0c\u5df2\u4fdd\u5b58\u5230 {result['save_path']}]")
+                        parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
                 else:
                     if ct.startswith("image/"):
-                        parts.append(f"[\u56fe\u7247: {fn or 'image'}]")
+                        parts.append(f"[图片: {fn or 'image'}]")
                     elif ct.startswith("video/"):
-                        parts.append(f"[\u89c6\u9891: {fn or 'video'}]")
+                        parts.append(f"[视频: {fn or 'video'}]")
                     else:
-                        parts.append(f"[\u9644\u4ef6: {fn or 'unknown'}]")
+                        parts.append(f"[附件: {fn or 'unknown'}]")
             attachment_info = " ".join(str(p) for p in parts)
 
         if not content and not attachment_info:
@@ -194,7 +194,7 @@ class AIQQBot(botpy.Client):
             return
 
         try:
-            await message.reply(content="\u7eb3\u897f\u59b2\u6536\u5230\u5566\uff0c\u6b63\u5728\u60f3\uff5e\ud83c\udf3f", msg_seq=_next_msg_seq())
+            await message.reply(content="纳西妲收到啦，正在想～🌿", msg_seq=_next_msg_seq())
 
             async def status_notify(msg: str):
                 await message.reply(content=msg, msg_seq=_next_msg_seq())
@@ -207,7 +207,7 @@ class AIQQBot(botpy.Client):
         except Exception as e:
             logger.error(f"qq_bot.c2c_error: {e}")
             try:
-                await message.reply(content="\u55ef\u2026\u2026\u51fa\u4e86\u70b9\u5c0f\u95ee\u9898\uff0c\u7b49\u4f1a\u513f\u518d\u804a\u597d\u4e0d\u597d\uff1f", msg_seq=_next_msg_seq())
+                await message.reply(content="嗯……出了点小问题，等会儿再聊好不好？", msg_seq=_next_msg_seq())
             except Exception:
                 pass
 
@@ -223,16 +223,16 @@ class AIQQBot(botpy.Client):
                 result = await self.agent.receive_file(att)
                 if result["status"] == "ok":
                     if result.get("text_preview"):
-                        parts.append(f"[\u6587\u4ef6: {fn}]\n\u5185\u5bb9\u9884\u89c8:\n{result['text_preview'][:500]}")
+                        parts.append(f"[文件: {fn}]\n内容预览:\n{result['text_preview'][:500]}")
                     else:
-                        parts.append(f"[\u6587\u4ef6: {fn}\uff0c\u5df2\u4fdd\u5b58\u5230 {result['save_path']}]")
+                        parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
                 else:
                     if ct.startswith("image/"):
-                        parts.append(f"[\u56fe\u7247: {fn or 'image'}]")
+                        parts.append(f"[图片: {fn or 'image'}]")
                     elif ct.startswith("video/"):
-                        parts.append(f"[\u89c6\u9891: {fn or 'video'}]")
+                        parts.append(f"[视频: {fn or 'video'}]")
                     else:
-                        parts.append(f"[\u9644\u4ef6: {fn or 'unknown'}]")
+                        parts.append(f"[附件: {fn or 'unknown'}]")
             attachment_info = " ".join(str(p) for p in parts)
 
         if not content and not attachment_info:
@@ -252,7 +252,7 @@ class AIQQBot(botpy.Client):
             return
 
         try:
-            await message.reply(content="\u7eb3\u897f\u59b2\u6536\u5230\u5566\uff0c\u6b63\u5728\u60f3\uff5e\ud83c\udf3f", msg_seq=_next_msg_seq())
+            await message.reply(content="纳西妲收到啦，正在想～🌿", msg_seq=_next_msg_seq())
 
             async def status_notify(msg: str):
                 await message.reply(content=msg, msg_seq=_next_msg_seq())
@@ -265,7 +265,7 @@ class AIQQBot(botpy.Client):
         except Exception as e:
             logger.error(f"qq_bot.group_error: {e}")
             try:
-                await message.reply(content="\u55ef\u2026\u2026\u51fa\u4e86\u70b9\u5c0f\u95ee\u9898\uff0c\u7b49\u4f1a\u513f\u518d\u804a\u597d\u4e0d\u597d\uff1f", msg_seq=_next_msg_seq())
+                await message.reply(content="嗯……出了点小问题，等会儿再聊好不好？", msg_seq=_next_msg_seq())
             except Exception:
                 pass
 
@@ -406,21 +406,21 @@ class AIQQBot(botpy.Client):
 if __name__ == "__main__":
     if not APP_ID or APP_ID == "your_app_id_here":
         print("=" * 55)
-        print("  \u8bf7\u5148\u914d\u7f6e QQ Bot AppID \u548c AppSecret")
+        print("  请先配置 QQ Bot AppID 和 AppSecret")
         print("")
-        print("  \u6b65\u9aa4:")
-        print("  1. \u6d4f\u89c8\u5668\u6253\u5f00: https://q.qq.com")
-        print("  2. \u7528\u624b\u673a QQ \u626b\u7801\u767b\u5f55")
-        print("  3. \u70b9\u51fb\u300c\u521b\u5efa\u673a\u5668\u4eba\u300d")
-        print("  4. \u590d\u5236 AppID \u548c AppSecret")
-        print("  5. \u586b\u5165 .env \u6587\u4ef6")
+        print("  步骤:")
+        print("  1. 浏览器打开: https://q.qq.com")
+        print("  2. 用手机 QQ 扫码登录")
+        print("  3. 点击「创建机器人」")
+        print("  4. 复制 AppID 和 AppSecret")
+        print("  5. 填入 .env 文件")
         print("=" * 55)
         sys.exit(1)
 
     print("=" * 50)
-    print("\u7eb3\u897f\u59b2\u7684 QQ Bot \u542f\u52a8\u4e2d...")
-    print("  \u79c1\u804a: \u5168\u81ea\u52a8\u56de\u590d")
-    print("  \u7fa4\u804a: @\u673a\u5668\u4eba \u89e6\u53d1")
+    print("纳西妲的 QQ Bot 启动中...")
+    print("  私聊: 全自动回复")
+    print("  群聊: @机器人 触发")
     print("=" * 50)
 
     intents = botpy.Intents(public_messages=True)
