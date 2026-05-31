@@ -1,60 +1,72 @@
-import os
-import json
-from flask import Flask, render_template, request, jsonify
-from flask_cors import CORS
-from dotenv import load_dotenv
-
-load_dotenv()
-
-from config import load_config
+import asyncio
+import streamlit as st
 from agent_core import AgentCore
 
-app = Flask(__name__)
-CORS(app)
+st.set_page_config(
+    page_title="AI Agent",
+    page_icon="🤖",
+    layout="wide"
+)
 
-config = load_config()
-agent = None
+st.title("🤖 全能型 AI Agent")
+st.caption("运行在 Orange Pi 上的智能助手 | 系统操作 • 文件管理 • 网络搜索 • 代码执行")
 
+if "agent" not in st.session_state:
+    with st.spinner("正在初始化 AI Agent..."):
+        agent = AgentCore()
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(agent.init())
+        st.session_state.agent = agent
+        st.session_state._loop = loop
+    st.success("✅ AI Agent 已就绪！")
 
-async def init_agent():
-    global agent
-    agent = AgentCore(config)
-    await agent.init()
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
+with st.sidebar:
+    st.header("🛠️ 工具列表")
+    st.markdown("""
+    **📁 文件操作**
+    - 列出目录内容
+    - 读取/写入文件
+    - 搜索文件
+    - 执行 Shell 命令
+    
+    **💻 代码执行**
+    - Python 代码运行
+    - 数学计算
+    
+    **🌐 网络工具**
+    - 网络搜索
+    - 天气查询
+    """)
+    
+    st.header("💡 使用示例")
+    st.markdown("""
+    - "列出主目录的文件"
+    - "读取某个配置文件"
+    - "搜索 Python 教程"
+    - "计算 123 * 456"
+    - "执行代码：打印九九乘法表"
+    - "北京今天天气怎么样"
+    """)
+    
+    if st.button("清空对话"):
+        st.session_state.messages = []
+        st.rerun()
 
-@app.route("/")
-def index():
-    return "<h1>纳西妲 AI Agent Web UI</h1><p>API endpoint: POST /api/chat</p>"
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-
-@app.route("/api/chat", methods=["POST"])
-def chat():
-    data = request.json
-    message = data.get("message", "")
-    user_id = data.get("user_id", "web_user")
-    if not message:
-        return jsonify({"error": "消息不能为空"}), 400
-
-    import asyncio
-    loop = asyncio.new_event_loop()
-    try:
-        reply = loop.run_until_complete(agent.process(message, user_id=user_id))
-        return jsonify({"reply": reply})
-    finally:
-        loop.close()
-
-
-@app.route("/api/status")
-def status():
-    return jsonify({
-        "status": "running",
-        "model": config.get("model_name"),
-    })
-
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(init_agent())
-    port = config.get("web_port", 5000)
-    host = config.get("web_host", "0.0.0.0")
-    app.run(host=host, port=port, debug=False)
+if prompt := st.chat_input("输入你的问题..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    with st.chat_message("assistant"):
+        with st.spinner("思考中..."):
+            response = st.session_state._loop.run_until_complete(st.session_state.agent.process_text(prompt))
+            st.markdown(response)
+    
+    st.session_state.messages.append({"role": "assistant", "content": response})
