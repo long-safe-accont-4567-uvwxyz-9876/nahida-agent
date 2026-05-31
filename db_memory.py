@@ -1,69 +1,90 @@
-import os
+import time
 import aiosqlite
 from loguru import logger
 
 
-class DBMemory:
+class MemoryDB:
 
-    def __init__(self, db_path: str):
-        self._db_path = db_path
-        self._db = None
+    def __init__(self, conn: aiosqlite.Connection):
+        self._conn = conn
+        conn.row_factory = aiosqlite.Row
 
-    async def init(self):
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._init_tables()
-        logger.info("db_memory.ready")
-
-    async def _init_tables(self):
-        await self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content TEXT NOT NULL,
-                tags TEXT DEFAULT '',
-                importance REAL DEFAULT 0.5,
-                access_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS conversations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                user_input TEXT NOT NULL,
-                assistant_reply TEXT NOT NULL,
-                user_id TEXT DEFAULT '',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags);
-            CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
-        """)
-        await self._db.commit()
-
-    async def close(self):
-        if self._db:
-            await self._db.close()
-
-    async def add_memory(self, content: str, tags: str = "", importance: float = 0.5) -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO memories (content, tags, importance) VALUES (?, ?, ?)",
-            (content, tags, importance)
+    async def insert_episodic_memory(self, summary: str, importance: float = 0.5,
+                                      emotion_label: str = "", session_id: str = "user",
+                                      embedding_id: int = -1):
+        cursor = await self._conn.execute(
+            """INSERT INTO episodic_memories
+               (timestamp, summary, importance, emotion_label, session_id, embedding_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (time.time(), summary, importance, emotion_label, session_id, embedding_id),
         )
-        await self._db.commit()
+        await self._conn.commit()
         return cursor.lastrowid
 
-    async def search(self, query: str, limit: int = 10) -> list:
-        cursor = await self._db.execute(
-            "SELECT id, content, tags, importance, created_at FROM memories WHERE content LIKE ? ORDER BY importance DESC LIMIT ?",
-            (f"%{query}%", limit)
+    async def get_memory_by_id(self, memory_id: int) -> dict | None:
+        cursor = await self._conn.execute(
+            "SELECT * FROM episodic_memories WHERE id=?", (memory_id,)
         )
-        rows = await cursor.fetchall()
-        return [{"id": r[0], "content": r[1], "tags": r[2], "importance": r[3], "created_at": r[4]} for r in rows]
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
-    async def get_recent(self, limit: int = 10) -> list:
-        cursor = await self._db.execute(
-            "SELECT id, content, tags, importance, created_at FROM memories ORDER BY created_at DESC LIMIT ?",
-            (limit,)
+    async def get_recent_conversations(self, limit: int = 20):
+        cursor = await self._conn.execute(
+            """SELECT * FROM conversation_logs
+               ORDER BY id DESC LIMIT ?""",
+            (limit,),
         )
         rows = await cursor.fetchall()
-        return [{"id": r[0], "content": r[1], "tags": r[2], "importance": r[3], "created_at": r[4]} for r in rows]
+        return [dict(r) for r in reversed(rows)]
+
+    async def search_memories_by_importance(self, min_importance: float = 0.3, limit: int = 10):
+        cursor = await self._conn.execute(
+            """SELECT * FROM episodic_memories
+               WHERE importance >= ?
+               ORDER BY timestamp DESC LIMIT ?""",
+            (min_importance, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_all_memories(self):
+        cursor = await self._conn.execute(
+            "SELECT * FROM episodic_memories ORDER BY timestamp DESC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_memory(self, memory_id: int):
+        await self._conn.execute("DELETE FROM episodic_memories WHERE id=?", (memory_id,))
+        await self._conn.commit()
+
+    async def get_episodic_recent(self, limit: int = 50):
+        cursor = await self._conn.execute(
+            """SELECT * FROM episodic_memories
+               ORDER BY timestamp DESC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_episodic_count(self) -> int:
+        cursor = await self._conn.execute("SELECT COUNT(*) as cnt FROM episodic_memories")
+        row = await cursor.fetchone()
+        return row["cnt"] if row else 0
+
+    async def insert_portrait(self, content: str, version: int = 1,
+                               source_ids: str = "", change_log: str = "") -> int:
+        cursor = await self._conn.execute(
+            """INSERT INTO user_portrait (content, version, source_ids, change_log, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (content, version, source_ids, change_log, time.time()),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_latest_portrait(self) -> dict | None:
+        cursor = await self._conn.execute(
+            "SELECT * FROM user_portrait ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
