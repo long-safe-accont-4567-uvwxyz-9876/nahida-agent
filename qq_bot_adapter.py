@@ -1,508 +1,430 @@
 import os
 import sys
+import ssl
 import asyncio
-import json
 import base64
-import tempfile
-import uuid
-from datetime import datetime
+import time
 from pathlib import Path
-from typing import Optional
-from io import BytesIO
-
-import botpy
-from botpy import logging as qq_logging
-from botpy.message import Message, GroupMessage, C2CMessage
-from botpy.types.message import Media
 
 from dotenv import load_dotenv
-
 load_dotenv()
+
+_original_create_default_context = ssl.create_default_context
+
+def _patched_create_default_context(*args, **kwargs):
+    ctx = _original_create_default_context(*args, **kwargs)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+ssl.create_default_context = _patched_create_default_context
 
 from logging_config import setup_logging
 setup_logging()
 
-from loguru import logger as loguru_logger
-from config import load_config
-from agent_core import AgentCore
-from agent_dispatcher import SubAgentConfig
-from task_orchestrator import build_task_graph, run_task_graph
-from text_utils import split_long_reply, smart_truncate
-from emoji_config import get_status_msg
-from slash_commands import SlashCommandHandler
-from knowledge_graph import KnowledgeGraph
-from sticker_manager import StickerManager
+from loguru import logger
+
+import botpy
+from botpy.gateway import BotWebSocket
+from botpy.message import C2CMessage, GroupMessage
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from agent_core import AgentCore, ProcessResult
+from config import AGENT_CONFIG
 from nudge_engine import NudgeEngine
-from portrait_manager import PortraitManager
-from file_receiver import FileReceiver
-from db_memory import MemoryDB
+
+_original_is_system_event = BotWebSocket._is_system_event
+
+async def _patched_is_system_event(self, message_event, ws):
+    event_op = message_event.get("op")
+    if event_op == BotWebSocket.WS_HEARTBEAT_ACK:
+        self._last_heartbeat_ack = asyncio.get_event_loop().time()
+    return await _original_is_system_event(self, message_event, ws)
+
+BotWebSocket._is_system_event = _patched_is_system_event
+
+_original_send_heart = BotWebSocket._send_heart
+
+async def _patched_send_heart(self, interval):
+    _log = __import__("botpy.logging", fromlist=["get_logger"]).get_logger()
+    _log.info("[botpy] \u5fc3\u8df3\u7ef4\u6301\u542f\u52a8\uff08\u5e26\u8d85\u65f6\u68c0\u6d4b\uff09...")
+    self._last_heartbeat_ack = asyncio.get_event_loop().time()
+    missed_acks = 0
+    while True:
+        if self._conn is None:
+            _log.debug("[botpy] \u8fde\u63a5\u5df2\u5173\u95ed!")
+            return
+        if self._conn.closed:
+            _log.debug("[botpy] ws\u8fde\u63a5\u5df2\u5173\u95ed, \u5fc3\u8df3\u68c0\u6d4b\u505c\u6b62")
+            return
+
+        now = asyncio.get_event_loop().time()
+        if now - self._last_heartbeat_ack > interval * 2.5:
+            missed_acks += 1
+            _log.warning(f"[botpy] \u5fc3\u8df3ACK\u8d85\u65f6 ({missed_acks}\u6b21), \u4e0a\u6b21ACK: {int(now - self._last_heartbeat_ack)}\u79d2\u524d")
+            if missed_acks >= 2:
+                _log.warning("[botpy] \u5fc3\u8df3ACK\u8fde\u7eed\u8d85\u65f6\uff0c\u5f3a\u5236\u65ad\u5f00\u91cd\u8fde!")
+                await self._conn.close()
+                return
+        else:
+            missed_acks = 0
+
+        payload = {
+            "op": self.WS_HEARTBEAT,
+            "d": self._session["last_seq"],
+        }
+        await self.send_msg(__import__("json").dumps(payload))
+        await asyncio.sleep(interval)
+
+BotWebSocket._send_heart = _patched_send_heart
+
+APP_ID = os.getenv("QQBOT_APP_ID")
+APP_SECRET = os.getenv("QQBOT_APP_SECRET")
+
+_qq_cfg = AGENT_CONFIG.get("qq_bot", {})
+MAX_REPLY_LEN = _qq_cfg.get("max_reply_length", 8000)
+
+_msg_seq_counter = int(time.time() * 1000) % (10 ** 8)
+
+def _next_msg_seq() -> int:
+    global _msg_seq_counter
+    _msg_seq_counter += 1
+    return _msg_seq_counter
 
 
-class QQBotAdapter(botpy.Client):
+class AIQQBot(botpy.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.agent = AgentCore()
+        self.nudge_engine = None
+        self._processed_msg_ids = set()
+        self._MAX_MSG_IDS = 100
 
-    def __init__(self):
-        intents = botpy.Intents.none()
-        intents.public_messages = True
-        intents.direct_message = True
-        super().__init__(intents=intents)
-
-        self._config = load_config()
-        self._agent_core: Optional[AgentCore] = None
-        self._slash_handler: Optional[SlashCommandHandler] = None
-        self._task_graph = None
-        self._knowledge_graph: Optional[KnowledgeGraph] = None
-        self._sticker_manager: Optional[StickerManager] = None
-        self._nudge_engine: Optional[NudgeEngine] = None
-        self._portrait_manager: Optional[PortraitManager] = None
-        self._file_receiver: Optional[FileReceiver] = None
-        self._ready = False
+    def _is_duplicate_msg(self, msg_id: str) -> bool:
+        if msg_id in self._processed_msg_ids:
+            return True
+        self._processed_msg_ids.add(msg_id)
+        if len(self._processed_msg_ids) > self._MAX_MSG_IDS:
+            excess = len(self._processed_msg_ids) - self._MAX_MSG_IDS
+            for _ in range(excess):
+                self._processed_msg_ids.pop()
+        return False
 
     async def on_ready(self):
-        loguru_logger.info("qq_bot.ready", bot_name=self.robot.name)
-        await self._init_components()
-        self._ready = True
+        logger.info("qq_bot.connected", app_id=APP_ID)
+        await self.agent.init()
 
-    async def _init_components(self):
-        self._agent_core = AgentCore(self._config)
-        await self._agent_core.init()
+        nudge_enabled = os.getenv("NUDGE_ENABLED", "false").lower() == "true"
+        if nudge_enabled:
+            user_openid = os.getenv("NUDGE_USER_OPENID", "")
+            if user_openid:
+                try:
+                    self.nudge_engine = NudgeEngine(
+                        db=self.agent.db,
+                        analytics=self.agent.db.analytics,
+                        router=self.agent.router,
+                        api=self.api,
+                        user_openid=user_openid,
+                        greeting_threshold=int(os.getenv("NUDGE_GREETING_THRESHOLD", "3600")),
+                        dnd_start=int(os.getenv("NUDGE_DND_START", "23")),
+                        dnd_end=int(os.getenv("NUDGE_DND_END", "8")),
+                        portrait_manager=self.agent.portrait_manager,
+                    )
+                    await self.nudge_engine.start()
+                except Exception as e:
+                    logger.warning("nudge.init_failed", error=str(e))
 
-        self._slash_handler = SlashCommandHandler(self._agent_core)
+        logger.info("qq_bot.agent_initialized")
 
-        from agent_dispatcher import AgentDispatcher, SubAgentConfig
-        dispatcher = self._agent_core._dispatcher
+    async def on_error(self, error):
+        logger.error("qq_bot.ws_error", error=str(error)[:200])
 
-        client = self._agent_core._model_router.get_client()
-        model = self._agent_core._model_router.model
-        self._task_graph = build_task_graph(
-            dispatcher,
-            dispatcher._agents,
-            client,
-            model,
-            nahida_chat_callback=self._agent_core.chat,
-        )
-
-        self._knowledge_graph = KnowledgeGraph(self._config)
-        await self._knowledge_graph.init()
-
-        self._sticker_manager = StickerManager()
-        self._portrait_manager = PortraitManager(self._config)
-        self._file_receiver = FileReceiver()
-
-        owner_qq = self._config.get("owner_qq")
-        if owner_qq:
-            self._nudge_engine = NudgeEngine(self, self._agent_core, self._config)
-            asyncio.create_task(self._nudge_engine.start())
-
-        loguru_logger.info("qq_bot.components_initialized")
+    async def on_close(self, close_status_code, close_msg):
+        logger.warning("qq_bot.ws_closed", code=close_status_code, msg=str(close_msg)[:100])
 
     async def on_c2c_message_create(self, message: C2CMessage):
-        if not self._ready:
-            return
-
-        user_openid = message.author.user_openid
         content = message.content.strip()
 
-        if not content:
+        attachment_info = ""
+        if hasattr(message, 'attachments') and message.attachments:
+            parts = []
+            for att in message.attachments:
+                ct = getattr(att, 'content_type', '') or ''
+                fn = getattr(att, 'filename', '') or ''
+                result = await self.agent.receive_file(att)
+                if result["status"] == "ok":
+                    if result.get("text_preview"):
+                        parts.append(f"[\u6587\u4ef6: {fn}]\n\u5185\u5bb9\u9884\u89c8:\n{result['text_preview'][:500]}")
+                    else:
+                        parts.append(f"[\u6587\u4ef6: {fn}\uff0c\u5df2\u4fdd\u5b58\u5230 {result['save_path']}]")
+                else:
+                    if ct.startswith("image/"):
+                        parts.append(f"[\u56fe\u7247: {fn or 'image'}]")
+                    elif ct.startswith("video/"):
+                        parts.append(f"[\u89c6\u9891: {fn or 'video'}]")
+                    else:
+                        parts.append(f"[\u9644\u4ef6: {fn or 'unknown'}]")
+            attachment_info = " ".join(str(p) for p in parts)
+
+        if not content and not attachment_info:
             return
 
-        if content.startswith("/"):
-            await self._handle_slash_command(message, content, user_openid, "c2c")
-            return
+        user_input = f"{content} {attachment_info}".strip() if content else attachment_info
 
-        if message.attachments:
-            await self._handle_media_message(message, content, user_openid, "c2c")
+        user_openid = getattr(message.author, 'user_openid', '') if hasattr(message, 'author') else ''
+        user_id = f"qq_{user_openid}" if user_openid else "qq_unknown"
+        logger.info("qq_bot.c2c_message", user_id=user_id, openid=user_openid, content=user_input[:80])
+
+        if self.nudge_engine:
+            self.nudge_engine.poke()
+
+        session_id = ""
+        try:
+            session = await self.agent.get_session(user_openid)
+            if session:
+                session_id = session["id"]
+            else:
+                session_id = await self.agent.create_session(user_openid)
+        except Exception:
+            pass
+
+        msg_id = getattr(message, 'id', '') or getattr(message, 'message_id', '')
+        if msg_id and self._is_duplicate_msg(msg_id):
             return
 
         try:
-            async def status_callback(msg: str):
-                try:
-                    await message._api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=msg,
-                    )
-                except Exception as e:
-                    loguru_logger.debug("c2c.status_send_failed", error=str(e))
+            await message.reply(content="\u7eb3\u897f\u59b2\u6536\u5230\u5566\uff0c\u6b63\u5728\u60f3\uff5e\ud83c\udf3f", msg_seq=_next_msg_seq())
 
-            state = await run_task_graph(
-                self._task_graph,
-                content,
-                user_openid,
-                session_id=f"c2c_{user_openid}",
-                status_callback=status_callback,
-                agent_configs=getattr(self._task_graph, '_agent_configs', {}),
-                dispatcher=getattr(self._task_graph, '_dispatcher', None),
-            )
-            reply = state.final_output or state.sub_agent_reply or "旅行者，人家没听懂呢……"
+            async def status_notify(msg: str):
+                await message.reply(content=msg, msg_seq=_next_msg_seq())
 
-            await self._send_reply(message, reply, user_openid, "c2c")
-
-            asyncio.create_task(self._try_send_sticker(message, content, reply, user_openid, "c2c"))
-
+            result = await self.agent.process(user_input, user_id=user_id, source="qq_c2c",
+                                              user_openid=user_openid, session_id=session_id,
+                                              status_callback=status_notify)
+            if result.reply:
+                await self._send_reply_with_sticker(message, result)
         except Exception as e:
-            loguru_logger.error("c2c.process_error", error=str(e))
+            logger.error(f"qq_bot.c2c_error: {e}")
             try:
-                await message._api.post_c2c_message(
-                    openid=user_openid,
-                    msg_type=0,
-                    msg_id=message.id,
-                    content="旅行者，人家出了点小问题……稍后再试试吧",
-                )
+                await message.reply(content="\u55ef\u2026\u2026\u51fa\u4e86\u70b9\u5c0f\u95ee\u9898\uff0c\u7b49\u4f1a\u513f\u518d\u804a\u597d\u4e0d\u597d\uff1f", msg_seq=_next_msg_seq())
             except Exception:
                 pass
 
     async def on_group_at_message_create(self, message: GroupMessage):
-        if not self._ready:
-            return
-
-        group_openid = message.group_openid
-        member_openid = message.author.member_openid
         content = message.content.strip()
 
-        if not content:
+        attachment_info = ""
+        if hasattr(message, 'attachments') and message.attachments:
+            parts = []
+            for att in message.attachments:
+                ct = getattr(att, 'content_type', '') or ''
+                fn = getattr(att, 'filename', '') or ''
+                result = await self.agent.receive_file(att)
+                if result["status"] == "ok":
+                    if result.get("text_preview"):
+                        parts.append(f"[\u6587\u4ef6: {fn}]\n\u5185\u5bb9\u9884\u89c8:\n{result['text_preview'][:500]}")
+                    else:
+                        parts.append(f"[\u6587\u4ef6: {fn}\uff0c\u5df2\u4fdd\u5b58\u5230 {result['save_path']}]")
+                else:
+                    if ct.startswith("image/"):
+                        parts.append(f"[\u56fe\u7247: {fn or 'image'}]")
+                    elif ct.startswith("video/"):
+                        parts.append(f"[\u89c6\u9891: {fn or 'video'}]")
+                    else:
+                        parts.append(f"[\u9644\u4ef6: {fn or 'unknown'}]")
+            attachment_info = " ".join(str(p) for p in parts)
+
+        if not content and not attachment_info:
             return
 
-        if content.startswith("/"):
-            await self._handle_slash_command(message, content, member_openid, "group", group_openid=group_openid)
-            return
+        user_input = f"{content} {attachment_info}".strip() if content else attachment_info
 
-        if message.attachments:
-            await self._handle_media_message(message, content, member_openid, "group", group_openid=group_openid)
+        member_openid = getattr(message.author, 'member_openid', '') if hasattr(message, 'author') else ''
+        user_id = f"qq_{member_openid}" if member_openid else "qq_unknown"
+        logger.info("qq_bot.group_message", user_id=user_id, openid=member_openid, content=user_input[:80])
+
+        if self.nudge_engine:
+            self.nudge_engine.poke()
+
+        msg_id = getattr(message, 'id', '') or getattr(message, 'message_id', '')
+        if msg_id and self._is_duplicate_msg(msg_id):
             return
 
         try:
-            async def status_callback(msg: str):
+            await message.reply(content="\u7eb3\u897f\u59b2\u6536\u5230\u5566\uff0c\u6b63\u5728\u60f3\uff5e\ud83c\udf3f", msg_seq=_next_msg_seq())
+
+            async def status_notify(msg: str):
+                await message.reply(content=msg, msg_seq=_next_msg_seq())
+
+            result = await self.agent.process(user_input, user_id=user_id, source="qq_group",
+                                              user_openid=member_openid,
+                                              status_callback=status_notify)
+            if result.reply:
+                await self._send_reply_with_sticker(message, result)
+        except Exception as e:
+            logger.error(f"qq_bot.group_error: {e}")
+            try:
+                await message.reply(content="\u55ef\u2026\u2026\u51fa\u4e86\u70b9\u5c0f\u95ee\u9898\uff0c\u7b49\u4f1a\u513f\u518d\u804a\u597d\u4e0d\u597d\uff1f", msg_seq=_next_msg_seq())
+            except Exception:
                 pass
 
-            state = await run_task_graph(
-                self._task_graph,
-                content,
-                member_openid,
-                session_id=f"group_{group_openid}",
-                status_callback=status_callback,
-                agent_configs=getattr(self._task_graph, '_agent_configs', {}),
-                dispatcher=getattr(self._task_graph, '_dispatcher', None),
-            )
-            reply = state.final_output or state.sub_agent_reply or "旅行者，人家没听懂呢……"
-
-            segments = split_long_reply(reply)
-            for seg in segments:
-                seg = smart_truncate(seg)
-                try:
-                    await message._api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=seg,
-                    )
-                except Exception as e:
-                    loguru_logger.error("group.send_failed", error=str(e))
-
-            asyncio.create_task(self._try_send_sticker(message, content, reply, member_openid, "group", group_openid=group_openid))
-
-        except Exception as e:
-            loguru_logger.error("group.process_error", error=str(e))
-
-    async def _handle_slash_command(self, message, content: str, user_openid: str, msg_type: str, group_openid: str = ""):
-        try:
-            reply = await self._slash_handler.handle(content)
-
-            if msg_type == "c2c":
-                segments = split_long_reply(reply)
-                for seg in segments:
-                    seg = smart_truncate(seg)
-                    await message._api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=seg,
-                    )
-            else:
-                segments = split_long_reply(reply)
-                for seg in segments:
-                    seg = smart_truncate(seg)
-                    await message._api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=seg,
-                    )
-        except Exception as e:
-            loguru_logger.error("slash_command.error", error=str(e))
-
-    async def _handle_media_message(self, message, text_content: str, user_openid: str, msg_type: str, group_openid: str = ""):
-        try:
-            attachment = message.attachments[0] if message.attachments else None
-            if not attachment:
-                return
-
-            media_data = None
-            if hasattr(attachment, 'url') and attachment.url:
-                import aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(attachment.url) as resp:
-                        if resp.status == 200:
-                            media_data = await resp.read()
-
-            if not media_data:
-                await self._send_text_reply(message, "旅行者，人家没能下载到这个文件呢……", user_openid, msg_type, group_openid)
-                return
-
-            filename = getattr(attachment, 'filename', 'file')
-            file_path = await self._file_receiver.save_temp(media_data, filename)
-
-            context = ""
-            if text_content:
-                context = f"用户附带的文字说明: {text_content}"
-
-            reply = await self._agent_core.chat(
-                f"我收到了一个文件: {filename}，路径: {file_path}。{context} 请帮我处理这个文件。",
-                user_id=user_openid,
-            )
-
-            await self._send_reply(message, reply, user_openid, msg_type, group_openid=group_openid)
-
-        except Exception as e:
-            loguru_logger.error("media.handle_error", error=str(e))
-            await self._send_text_reply(message, "旅行者，处理文件时出了点问题……", user_openid, msg_type, group_openid)
-
-    async def _send_reply(self, message, reply: str, user_openid: str, msg_type: str, group_openid: str = ""):
-        emoji_path = None
-        if self._sticker_manager and self._agent_core:
-            emoji_path = self._sticker_manager.get_sticker(reply)
-
-        if emoji_path and os.path.exists(emoji_path):
-            try:
-                with open(emoji_path, "rb") as f:
-                    media_data = f.read()
-
-                if msg_type == "c2c":
-                    upload_result = await message._api.post_c2c_file(
-                        openid=user_openid,
-                        file_type=1,
-                        file_data=media_data,
-                        srv_send_msg=False,
-                    )
-                    if upload_result:
-                        await message._api.post_c2c_message(
-                            openid=user_openid,
-                            msg_type=7,
-                            msg_id=message.id,
-                            media=upload_result,
-                        )
-                else:
-                    upload_result = await message._api.post_group_file(
-                        group_openid=group_openid,
-                        file_type=1,
-                        file_data=media_data,
-                        srv_send_msg=False,
-                    )
-                    if upload_result:
-                        await message._api.post_group_message(
-                            group_openid=group_openid,
-                            msg_type=7,
-                            msg_id=message.id,
-                            media=upload_result,
-                        )
-            except Exception as e:
-                loguru_logger.debug("sticker.send_failed", error=str(e))
-
-        segments = split_long_reply(reply)
-        for seg in segments:
-            seg = smart_truncate(seg)
-            try:
-                if msg_type == "c2c":
-                    await message._api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=seg,
-                    )
-                else:
-                    await message._api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=0,
-                        msg_id=message.id,
-                        content=seg,
-                    )
-            except Exception as e:
-                loguru_logger.error("reply.send_failed", error=str(e), msg_type=msg_type)
-
-    async def _send_text_reply(self, message, text: str, user_openid: str, msg_type: str, group_openid: str = ""):
-        try:
-            if msg_type == "c2c":
-                await message._api.post_c2c_message(
-                    openid=user_openid,
-                    msg_type=0,
-                    msg_id=message.id,
-                    content=text,
-                )
-            else:
-                await message._api.post_group_message(
-                    group_openid=group_openid,
-                    msg_type=0,
-                    msg_id=message.id,
-                    content=text,
-                )
-        except Exception as e:
-            loguru_logger.error("text_reply.send_failed", error=str(e))
-
-    async def _try_send_sticker(self, message, user_input: str, reply: str, user_openid: str, msg_type: str, group_openid: str = ""):
-        try:
-            if not self._sticker_manager:
-                return
-
-            sticker_path = self._sticker_manager.get_sticker(reply)
-            if not sticker_path or not os.path.exists(sticker_path):
-                return
-
-            with open(sticker_path, "rb") as f:
-                media_data = f.read()
-
-            if msg_type == "c2c":
-                upload_result = await message._api.post_c2c_file(
-                    openid=user_openid,
-                    file_type=1,
-                    file_data=media_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await message._api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=7,
-                        msg_id=message.id,
-                        media=upload_result,
-                    )
-            else:
-                upload_result = await message._api.post_group_file(
-                    group_openid=group_openid,
-                    file_type=1,
-                    file_data=media_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await message._api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=7,
-                        msg_id=message.id,
-                        media=upload_result,
-                    )
-
-        except Exception as e:
-            loguru_logger.debug("sticker.async_send_failed", error=str(e))
-
-    async def send_audio(self, user_openid: str, audio_path: str, msg_type: str = "c2c", group_openid: str = ""):
-        try:
-            if not os.path.exists(audio_path):
-                return
-
-            with open(audio_path, "rb") as f:
-                audio_data = f.read()
-
-            if msg_type == "c2c":
-                upload_result = await self.api.post_c2c_file(
-                    openid=user_openid,
-                    file_type=3,
-                    file_data=audio_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await self.api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=7,
-                        media=upload_result,
-                    )
-            else:
-                upload_result = await self.api.post_group_file(
-                    group_openid=group_openid,
-                    file_type=3,
-                    file_data=audio_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await self.api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=7,
-                        media=upload_result,
-                    )
-
-            loguru_logger.info("audio.sent", msg_type=msg_type)
-
-        except Exception as e:
-            loguru_logger.error("audio.send_failed", error=str(e))
-
-    async def send_image(self, user_openid: str, image_path: str, msg_type: str = "c2c", group_openid: str = ""):
-        try:
-            if not os.path.exists(image_path):
-                return
-
-            with open(image_path, "rb") as f:
-                image_data = f.read()
-
-            if msg_type == "c2c":
-                upload_result = await self.api.post_c2c_file(
-                    openid=user_openid,
-                    file_type=1,
-                    file_data=image_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await self.api.post_c2c_message(
-                        openid=user_openid,
-                        msg_type=7,
-                        media=upload_result,
-                    )
-            else:
-                upload_result = await self.api.post_group_file(
-                    group_openid=group_openid,
-                    file_type=1,
-                    file_data=image_data,
-                    srv_send_msg=False,
-                )
-                if upload_result:
-                    await self.api.post_group_message(
-                        group_openid=group_openid,
-                        msg_type=7,
-                        media=upload_result,
-                    )
-
-            loguru_logger.info("image.sent", msg_type=msg_type)
-
-        except Exception as e:
-            loguru_logger.error("image.send_failed", error=str(e))
-
-    async def send_to_owner(self, content: str):
-        owner_qq = self._config.get("owner_qq")
-        if not owner_qq:
+    async def _send_reply_with_media(self, message, reply: str,
+                                      image_path: Path | None = None,
+                                      image_url: str | None = None):
+        if not image_path and not image_url:
+            await message.reply(content=reply, msg_seq=_next_msg_seq())
             return
+
         try:
-            await self.api.post_c2c_message(
-                openid=owner_qq,
-                msg_type=0,
-                content=content,
-            )
+            if isinstance(message, C2CMessage):
+                openid = message.author.user_openid
+                if image_path:
+                    file_info = await self._upload_c2c_base64(openid, image_path)
+                else:
+                    media = await self.api.post_c2c_file(
+                        openid=openid, file_type=1, url=image_url
+                    )
+                    file_info = media.file_info
+                await self.api.post_c2c_message(
+                    openid=openid, msg_id=message.id,
+                    msg_type=7, content=reply,
+                    media={"file_info": file_info}, msg_seq=_next_msg_seq()
+                )
+            elif isinstance(message, GroupMessage):
+                group_openid = message.group_openid
+                if image_path:
+                    file_info = await self._upload_group_base64(group_openid, image_path)
+                else:
+                    media = await self.api.post_group_file(
+                        group_openid=group_openid, file_type=1, url=image_url
+                    )
+                    file_info = media.file_info
+                await self.api.post_group_message(
+                    group_openid=group_openid, msg_id=message.id,
+                    msg_type=7, content=reply,
+                    media={"file_info": file_info}, msg_seq=_next_msg_seq()
+                )
+            else:
+                await message.reply(content=reply, msg_seq=_next_msg_seq())
         except Exception as e:
-            loguru_logger.error("owner.notify_failed", error=str(e))
+            logger.warning("qq_bot.media_send_failed", error=str(e))
+            await message.reply(content=reply, msg_seq=_next_msg_seq())
 
-    @property
-    def agent_core(self) -> Optional[AgentCore]:
-        return self._agent_core
+    async def _upload_c2c_base64(self, openid: str, image_path: Path, file_type: int = 1) -> str:
+        from botpy.http import Route
 
+        def _read():
+            with open(image_path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
 
-def main():
-    app_id = os.environ.get("QQ_APP_ID", "")
-    app_secret = os.environ.get("QQ_APP_SECRET", "")
+        file_data = await asyncio.to_thread(_read)
+        payload = {
+            "openid": openid,
+            "file_type": file_type,
+            "file_data": file_data,
+            "srv_send_msg": False,
+        }
+        route = Route("POST", "/v2/users/{openid}/files", openid=openid)
+        result = await self.api._http.request(route, json=payload)
+        if isinstance(result, dict):
+            return result.get("file_info", "")
+        return result.file_info
 
-    if not app_id or not app_secret:
-        print("请设置环境变量 QQ_APP_ID 和 QQ_APP_SECRET")
-        print("export QQ_APP_ID=your_app_id")
-        print("export QQ_APP_SECRET=your_app_secret")
-        sys.exit(1)
+    async def _upload_group_base64(self, group_openid: str, image_path: Path, file_type: int = 1) -> str:
+        from botpy.http import Route
 
-    bot = QQBotAdapter()
-    bot.run(appid=app_id, secret=app_secret)
+        def _read():
+            with open(image_path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+
+        file_data = await asyncio.to_thread(_read)
+        payload = {
+            "group_openid": group_openid,
+            "file_type": file_type,
+            "file_data": file_data,
+            "srv_send_msg": False,
+        }
+        route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=group_openid)
+        result = await self.api._http.request(route, json=payload)
+        if isinstance(result, dict):
+            return result.get("file_info", "")
+        return result.file_info
+
+    async def _send_reply_with_sticker(self, message, result: ProcessResult):
+        from text_utils import smart_truncate, split_long_reply
+
+        reply = result.reply
+        clean_reply = self.agent.strip_emotion_tag(reply)
+
+        parts = split_long_reply(clean_reply, MAX_REPLY_LEN)
+
+        if len(parts) == 1:
+            final_text = parts[0]
+        else:
+            for part in parts[:-1]:
+                try:
+                    await message.reply(content=part, msg_seq=_next_msg_seq())
+                except Exception:
+                    pass
+            final_text = parts[-1]
+
+        if result.sticker_path:
+            try:
+                await self._send_reply_with_media(message, final_text, image_path=result.sticker_path)
+            except Exception as e:
+                logger.warning("qq_bot.sticker_send_failed", error=str(e))
+                await message.reply(content=final_text, msg_seq=_next_msg_seq())
+        else:
+            await message.reply(content=final_text, msg_seq=_next_msg_seq())
+
+        if result.audio_path and result.audio_path.exists():
+            try:
+                await self._send_audio(message, result.audio_path)
+            except Exception as e:
+                logger.warning("qq_bot.audio_send_failed", error=str(e))
+
+    async def _send_audio(self, message, audio_path: Path):
+        if isinstance(message, C2CMessage):
+            openid = message.author.user_openid
+            file_info = await self._upload_c2c_base64(openid, audio_path, file_type=3)
+            await self.api.post_c2c_message(
+                openid=openid, msg_id=message.id,
+                msg_type=7, content="",
+                media={"file_info": file_info}, msg_seq=_next_msg_seq()
+            )
+        elif isinstance(message, GroupMessage):
+            group_openid = message.group_openid
+            file_info = await self._upload_group_base64(group_openid, audio_path, file_type=3)
+            await self.api.post_group_message(
+                group_openid=group_openid, msg_id=message.id,
+                msg_type=7, content="",
+                media={"file_info": file_info}, msg_seq=_next_msg_seq()
+            )
 
 
 if __name__ == "__main__":
-    main()
+    if not APP_ID or APP_ID == "your_app_id_here":
+        print("=" * 55)
+        print("  \u8bf7\u5148\u914d\u7f6e QQ Bot AppID \u548c AppSecret")
+        print("")
+        print("  \u6b65\u9aa4:")
+        print("  1. \u6d4f\u89c8\u5668\u6253\u5f00: https://q.qq.com")
+        print("  2. \u7528\u624b\u673a QQ \u626b\u7801\u767b\u5f55")
+        print("  3. \u70b9\u51fb\u300c\u521b\u5efa\u673a\u5668\u4eba\u300d")
+        print("  4. \u590d\u5236 AppID \u548c AppSecret")
+        print("  5. \u586b\u5165 .env \u6587\u4ef6")
+        print("=" * 55)
+        sys.exit(1)
+
+    print("=" * 50)
+    print("\u7eb3\u897f\u59b2\u7684 QQ Bot \u542f\u52a8\u4e2d...")
+    print("  \u79c1\u804a: \u5168\u81ea\u52a8\u56de\u590d")
+    print("  \u7fa4\u804a: @\u673a\u5668\u4eba \u89e6\u53d1")
+    print("=" * 50)
+
+    intents = botpy.Intents(public_messages=True)
+    is_sandbox = _qq_cfg.get("is_sandbox", False)
+    client = AIQQBot(intents=intents, is_sandbox=is_sandbox)
+
+    client.run(appid=APP_ID, secret=APP_SECRET)
