@@ -1,90 +1,158 @@
 import os
-import json
 from pathlib import Path
 from tool_registry import register_tool, ToolPermission, ToolResult
-from loguru import logger
+
+
+
+def _read_pdf(path: str) -> ToolResult:
+    try:
+        import pdfplumber
+    except ImportError:
+        return ToolResult.fail("PDF处理库未安装，请运行: pip install pdfplumber")
+
+    try:
+        target = os.path.expanduser(path)
+        if not os.path.exists(target):
+            return ToolResult.fail(f"文件不存在: {path}")
+
+        texts = []
+        with pdfplumber.open(target) as pdf:
+            total_pages = len(pdf.pages)
+            for i, page in enumerate(pdf.pages[:20]):
+                text = page.extract_text()
+                if text:
+                    texts.append(f"--- 第{i+1}页 ---\n{text}")
+
+            tables = []
+            for i, page in enumerate(pdf.pages[:5]):
+                page_tables = page.extract_tables()
+                for ti, table in enumerate(page_tables):
+                    if table:
+                        rows = [" | ".join(str(c or "") for c in row) for row in table[:10]]
+                        tables.append(f"第{i+1}页 表格{ti+1}:\n" + "\n".join(rows))
+
+        content = f"PDF: {target} ({total_pages}页)\n\n"
+        content += "\n\n".join(texts[:3000])
+        if tables:
+            content += "\n\n--- 表格 ---\n" + "\n\n".join(tables[:1000])
+        return ToolResult.ok(content[:5000])
+    except Exception as e:
+        return ToolResult.fail(f"PDF读取错误: {str(e)}")
+
+
+def _read_docx(path: str) -> ToolResult:
+    try:
+        from docx import Document
+    except ImportError:
+        return ToolResult.fail("DOCX处理库未安装，请运行: pip install python-docx")
+
+    try:
+        target = os.path.expanduser(path)
+        if not os.path.exists(target):
+            return ToolResult.fail(f"文件不存在: {path}")
+
+        doc = Document(target)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        tables_text = []
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text for cell in row.cells]
+                tables_text.append(" | ".join(cells))
+
+        content = f"DOCX: {target}\n\n"
+        content += "\n".join(paragraphs[:200])
+        if tables_text:
+            content += "\n\n--- 表格 ---\n" + "\n".join(tables_text[:50])
+        return ToolResult.ok(content[:5000])
+    except Exception as e:
+        return ToolResult.fail(f"DOCX读取错误: {str(e)}")
+
+
+def _read_pptx(path: str) -> ToolResult:
+    try:
+        from pptx import Presentation
+    except ImportError:
+        return ToolResult.fail("PPTX处理库未安装，请运行: pip install python-pptx")
+
+    try:
+        target = os.path.expanduser(path)
+        if not os.path.exists(target):
+            return ToolResult.fail(f"文件不存在: {path}")
+
+        prs = Presentation(target)
+        slides_text = []
+        for i, slide in enumerate(prs.slides[:30]):
+            texts = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    texts.append(shape.text)
+            if texts:
+                slides_text.append(f"--- 幻灯片{i+1} ---\n" + "\n".join(texts))
+
+        content = f"PPTX: {target} ({len(prs.slides)}页)\n\n"
+        content += "\n\n".join(slides_text)
+        return ToolResult.ok(content[:5000])
+    except Exception as e:
+        return ToolResult.fail(f"PPTX读取错误: {str(e)}")
+
+
+def _read_xlsx(path: str) -> ToolResult:
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        return ToolResult.fail("XLSX处理库未安装，请运行: pip install openpyxl")
+
+    try:
+        target = os.path.expanduser(path)
+        if not os.path.exists(target):
+            return ToolResult.fail(f"文件不存在: {path}")
+
+        wb = load_workbook(target, read_only=True, data_only=True)
+        sheets_text = []
+        for sheet_name in wb.sheetnames[:5]:
+            ws = wb[sheet_name]
+            rows = []
+            for i, row in enumerate(ws.iter_rows(max_row=30, values_only=True)):
+                cells = [str(c) if c is not None else "" for c in row]
+                rows.append(" | ".join(cells))
+            if rows:
+                sheets_text.append(f"--- {sheet_name} ---\n" + "\n".join(rows))
+
+        wb.close()
+        content = f"XLSX: {target} ({len(wb.sheetnames)}个工作表)\n\n"
+        content += "\n\n".join(sheets_text)
+        return ToolResult.ok(content[:5000])
+    except Exception as e:
+        return ToolResult.fail(f"XLSX读取错误: {str(e)}")
 
 
 @register_tool(
     name="document_reader",
-    description="读取文档文件内容（支持 PDF、Word、Excel、CSV、TXT）",
+    description="读取文档内容。支持 PDF、DOCX、PPTX、XLSX 格式。输入文件路径。",
     schema={
         "type": "object",
         "properties": {
-            "file_path": {"type": "string", "description": "文档文件路径"},
-            "max_pages": {"type": "integer", "description": "最大读取页数", "default": 10},
+            "path": {"type": "string", "description": "文档文件路径"}
         },
-        "required": ["file_path"],
+        "required": ["path"],
     },
     permission=ToolPermission.READ_ONLY,
     category="document",
-    max_frequency=5,
 )
-async def document_reader(file_path: str, max_pages: int = 10) -> ToolResult:
-    try:
-        path = Path(file_path).resolve()
-        if not path.exists():
-            return ToolResult.fail(f"文件不存在：{file_path}")
-
-        suffix = path.suffix.lower()
-
-        if suffix == ".txt":
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(50000)
-            return ToolResult.ok(content)
-
-        if suffix == ".csv":
-            import csv
-            rows = []
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.reader(f)
-                for i, row in enumerate(reader):
-                    if i > max_pages * 50:
-                        break
-                    rows.append(row)
-            return ToolResult.ok(rows)
-
-        if suffix in [".xlsx", ".xls"]:
-            try:
-                import openpyxl
-                wb = openpyxl.load_workbook(path, read_only=True)
-                result = {}
-                for sheet_name in wb.sheetnames:
-                    ws = wb[sheet_name]
-                    rows = []
-                    for i, row in enumerate(ws.iter_rows(values_only=True)):
-                        if i > 100:
-                            break
-                        rows.append(list(row))
-                    result[sheet_name] = rows
-                wb.close()
-                return ToolResult.ok(result)
-            except ImportError:
-                return ToolResult.fail("需要安装 openpyxl：pip install openpyxl")
-
-        if suffix == ".pdf":
-            try:
-                import PyPDF2
-                with open(path, "rb") as f:
-                    reader = PyPDF2.PdfReader(f)
-                    text = ""
-                    for i, page in enumerate(reader.pages):
-                        if i >= max_pages:
-                            break
-                        text += page.extract_text() or ""
-                return ToolResult.ok(text[:50000])
-            except ImportError:
-                return ToolResult.fail("需要安装 PyPDF2：pip install PyPDF2")
-
-        if suffix in [".docx", ".doc"]:
-            try:
-                import docx
-                doc = docx.Document(path)
-                text = "\n".join([p.text for p in doc.paragraphs])
-                return ToolResult.ok(text[:50000])
-            except ImportError:
-                return ToolResult.fail("需要安装 python-docx：pip install python-docx")
-
-        return ToolResult.fail(f"不支持的文件格式：{suffix}")
-    except Exception as e:
-        return ToolResult.fail(f"读取文档失败：{str(e)}")
+def document_reader(path: str) -> ToolResult:
+    ext = Path(os.path.expanduser(path)).suffix.lower()
+    readers = {
+        '.pdf': _read_pdf,
+        '.docx': _read_docx,
+        '.doc': _read_docx,
+        '.pptx': _read_pptx,
+        '.ppt': _read_pptx,
+        '.xlsx': _read_xlsx,
+        '.xls': _read_xlsx,
+    }
+    reader = readers.get(ext)
+    if not reader:
+        supported = ", ".join(readers.keys())
+        return ToolResult.fail(f"不支持的格式: {ext}。支持: {supported}")
+    return reader(path)
