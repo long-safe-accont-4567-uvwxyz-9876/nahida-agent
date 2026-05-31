@@ -1,41 +1,168 @@
-import os
+import json
+import time
 from loguru import logger
+
+from db_memory import MemoryDB
+
+
+CONSOLIDATE_PROMPT = """你是纳西妲。现在是一个安静的夜晚，你要更新你对旅行者的印象了。
+
+{old_section}
+
+这是最近和旅行者的对话片段——
+{recent_memories}
+
+这是人家近期记下的关于旅行者的笔记——
+{recent_notes}
+
+请用纳西妲的口吻，写一段对旅行者的印象（300-600字，不要超过800字）：
+
+要求：
+- 像在心里轻轻描摹一个人的样子——不是档案，不是评估，是印象
+- 关于旅行者是什么样的人、他喜欢什么、不喜欢什么
+- 关于你们之间的关系——最近是近了一些还是远了一些，有什么不一样了吗
+- 不要列举，不要总结编号。像在日记里写一段关于一个人的文字
+- 只写对话和笔记里明确提到过的事。不推测旅行者没说过的心情，不补充你没观察到的细节
+- 不确定的地方要用"好像""似乎""人家觉得"——这是你的感知，不是事实
+- 旧印象中如果有些内容最近不再出现了，可以自然淡出，不必刻意提及
+- 自称"人家"或"纳西妲"，叫对方"旅行者"
+
+返回 JSON（只返回这个，不要其他文字）：
+{{"portrait": "全文...", "changes": "一句话说明这次更新了什么"}}"""
+
+
+def _build_consolidate_prompt(old_section, recent_memories, recent_notes):
+    return (
+        CONSOLIDATE_PROMPT
+        .replace("{old_section}", old_section)
+        .replace("{recent_memories}", recent_memories)
+        .replace("{recent_notes}", recent_notes)
+    )
 
 
 class PortraitManager:
 
-    def __init__(self, config: dict):
-        self._config = config
-        self._portraits = {
-            "nahida": {
-                "name": "纳西妲",
-                "title": "草神",
-                "personality": "温柔、智慧、好奇",
-            },
-            "xilian": {
-                "name": "希兰",
-                "title": "搜索助手",
-                "personality": "活泼、好奇、善于发现",
-            },
-            "yinlang": {
-                "name": "银狼",
-                "title": "花之骑士",
-                "personality": "冷静、专业、技术控",
-            },
-            "nike": {
-                "name": "妮可",
-                "title": "知识探求者",
-                "personality": "博学、深度、学者",
-            },
-            "keli": {
-                "name": "可莉",
-                "title": "火花骑士",
-                "personality": "活泼、可爱、充满好奇心",
-            },
-        }
+    def __init__(self, db, memory: MemoryDB, router, notebook=None):
+        self._db = db
+        self.memory = memory
+        self.notebook = notebook
+        self._router = router
+        self._dirty = True
 
-    def get_portrait(self, name: str) -> dict:
-        return self._portraits.get(name, {})
+    def mark_dirty(self):
+        self._dirty = True
+        logger.debug("portrait.marked_dirty")
 
-    def list_portraits(self) -> list:
-        return list(self._portraits.values())
+    async def get_current_portrait(self) -> dict | None:
+        return await self.memory.get_latest_portrait()
+
+    async def consolidate(self, force: bool = False) -> str | None:
+        if not force and not self._dirty:
+            logger.debug("portrait.clean_skipped")
+            return None
+
+        try:
+            memories = await self.memory.get_episodic_recent(limit=50)
+        except Exception as e:
+            logger.warning("portrait.memories_failed", error=str(e))
+            memories = []
+
+        try:
+            notes = await self.notebook.get_notebook_notes(limit=10)
+        except Exception as e:
+            logger.warning("portrait.notes_failed", error=str(e))
+            notes = []
+
+        if not memories and not notes:
+            logger.info("portrait.no_material")
+            return None
+
+        old = await self.memory.get_latest_portrait()
+        old_section = ""
+        version = 1
+        if old and old.get("content"):
+            old_section = f"这是人家之前对旅行者的印象——\n{old['content']}"
+            version = old.get("version", 0) + 1
+
+        mem_lines = []
+        for m in memories[:20]:
+            summary = m.get("summary", "")
+            if summary and len(summary) > 5:
+                mem_lines.append(f"\u00b7 {summary[:200]}")
+        recent_memories = "\n".join(mem_lines) if mem_lines else "（最近好像没有留下什么特别的对话呢）"
+
+        note_lines = []
+        for n in notes[:8]:
+            content = n.get("content", "")
+            if content and len(content) > 3:
+                note_lines.append(f"\u00b7 [{n.get('kind', 'note')}] {content[:150]}")
+        recent_notes = "\n".join(note_lines) if note_lines else "（笔记本里空空如也）"
+
+        prompt = _build_consolidate_prompt(
+            old_section=old_section,
+            recent_memories=recent_memories,
+            recent_notes=recent_notes,
+        )
+
+        try:
+            raw = await self._router.route(
+                "memory_encoding",
+                [{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=1200,
+            )
+        except Exception as e:
+            logger.error("portrait.llm_failed", error=str(e))
+            return None
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                start = raw.index("{")
+                end = raw.rindex("}") + 1
+                data = json.loads(raw[start:end])
+            except (ValueError, json.JSONDecodeError):
+                logger.warning("portrait.json_parse_failed", preview=raw[:100])
+                return None
+
+        portrait_text = data.get("portrait", "").strip()
+        changes = data.get("changes", "").strip()
+
+        if not portrait_text or len(portrait_text) < 50:
+            logger.warning("portrait.too_short", length=len(portrait_text))
+            return None
+
+        source_ids = ",".join(str(m.get("id", "")) for m in memories[:15])
+
+        try:
+            await self.memory.insert_portrait(
+                content=portrait_text,
+                version=version,
+                source_ids=source_ids,
+                change_log=changes,
+            )
+            logger.info(
+                "portrait.consolidated",
+                version=version,
+                length=len(portrait_text),
+                changes=changes[:80] if changes else "",
+            )
+            self._dirty = False
+        except Exception as e:
+            logger.error("portrait.db_write_failed", error=str(e))
+            return None
+
+        return portrait_text
+
+    async def ensure_exists(self) -> str | None:
+        existing = await self.memory.get_latest_portrait()
+        if existing:
+            return None
+
+        count = await self.memory.get_episodic_count()
+        if count < 5:
+            return None
+
+        logger.info("portrait.cold_start", episodic_count=count)
+        return await self.consolidate()
