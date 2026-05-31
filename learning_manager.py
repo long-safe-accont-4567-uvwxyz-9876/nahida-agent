@@ -1,52 +1,68 @@
-import os
 import json
-import aiosqlite
+import time
 from loguru import logger
+from db_learning import LearningDB
 
 
 class LearningManager:
 
-    def __init__(self, db_path: str = "data/learning.db"):
-        self._db_path = db_path
-        self._db = None
+    def __init__(self, db=None, learning_db: LearningDB | None = None, router=None):
+        self._db = db
+        self.learning_db = learning_db
+        self._router = router
 
-    async def init(self):
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        self._db = await aiosqlite.connect(self._db_path)
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._init_tables()
-        logger.info("learning_manager.ready")
+    def set_db(self, db):
+        self._db = db
 
-    async def _init_tables(self):
-        await self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS learning (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                content TEXT NOT NULL,
-                source TEXT DEFAULT '',
-                mastered BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS idx_learning_category ON learning(category);
-        """)
-        await self._db.commit()
+    def set_learning_db(self, learning_db: LearningDB):
+        self.learning_db = learning_db
 
-    async def close(self):
-        if self._db:
-            await self._db.close()
+    def set_router(self, router):
+        self._router = router
 
-    async def add(self, category: str, content: str, source: str = "") -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO learning (category, content, source) VALUES (?, ?, ?)",
-            (category, content, source)
-        )
-        await self._db.commit()
-        return cursor.lastrowid
+    async def record_interaction(self, user_input: str, assistant_reply: str,
+                                  user_id: str = "", context: dict | None = None):
+        if not self.learning_db:
+            return
 
-    async def get_by_category(self, category: str, limit: int = 20) -> list:
-        cursor = await self._db.execute(
-            "SELECT id, content, source, mastered, created_at FROM learning WHERE category = ? ORDER BY id DESC LIMIT ?",
-            (category, limit)
-        )
-        rows = await cursor.fetchall()
-        return [{"id": r[0], "content": r[1], "source": r[2], "mastered": r[3], "created_at": r[4]} for r in rows]
+        try:
+            interaction_data = {
+                "user_input": user_input[:500],
+                "assistant_reply": assistant_reply[:500],
+                "user_id": user_id,
+                "timestamp": time.time(),
+                "context": context or {},
+            }
+            await self.learning_db.insert_learning_record(
+                category="interaction",
+                content=json.dumps(interaction_data, ensure_ascii=False),
+                importance=1,
+            )
+        except Exception as e:
+            logger.debug("learning.record_failed", error=str(e))
+
+    async def get_learning_context(self, query: str = "", limit: int = 3) -> str:
+        if not self.learning_db:
+            return ""
+
+        try:
+            records = await self.learning_db.search_learning_records(query, limit=limit)
+            if not records:
+                return ""
+
+            parts = ["[学习经验]"]
+            for r in records:
+                parts.append(f"- {r.get('content', '')[:200]}")
+            return "\n".join(parts)
+        except Exception as e:
+            logger.debug("learning.context_failed", error=str(e))
+            return ""
+
+    async def get_stats(self) -> dict:
+        if not self.learning_db:
+            return {}
+
+        try:
+            return await self.learning_db.get_stats()
+        except Exception:
+            return {}

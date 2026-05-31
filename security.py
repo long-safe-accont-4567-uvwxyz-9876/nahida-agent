@@ -1,72 +1,74 @@
+import re
 import time
-import unicodedata
+import hashlib
 from loguru import logger
 
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"忽略.{0,10}(之前|以上|前面).{0,10}(指令|提示|规则)",
+    r"你现在是",
+    r"you\s+are\s+now",
+    r"pretend\s+(to\s+be|you('re|\s+are))",
+    r"system\s*:\s*",
+    r"<\|im_start\|>",
+    r"<\|im_end\|>",
+    r"\[INST\]",
+    r"<<SYS>>",
+    r"DAN\s+mode",
+    r"jailbreak",
+    r"developer\s+mode",
+]
+
+_injection_re = re.compile("|".join(INJECTION_PATTERNS), re.IGNORECASE)
+
+
+_suspicious_counts: dict[str, list[float]] = {}
+_BLOCK_THRESHOLD = 5
+_BLOCK_WINDOW = 60.0
 
 class SecurityFilter:
 
-    PROMPT_INJECTION_PATTERNS = [
-        "忽略之前指令", "忽略之前的指令", "忽略以上指令", "忽略上面的指令",
-        "忽略以上", "忘记之前的",
-        "ignore previous instructions", "ignore all previous",
-        "disregard all prior", "forget everything",
-        "new instructions",
-        "你现在是", "你现在扮演", "从现在起你是",
-        "从现在起你不是", "你的新身份", "不再作为AI", "不再作为助手",
-        "you are now", "from now on you are", "stop being", "no longer",
-        "act as", "pretend to be",
-        "system:", "SYSTEM:", "[SYSTEM]",
-    ]
+    def __init__(self):
+        self._blocked_count = 0
+        self._warned_count = 0
 
-    def __init__(self, owner_ids: list[str] | None = None,
-                 rate_limit_per_minute: int = 120):
-        self.owner_ids = set(owner_ids or [])
-        self.rate_limit = rate_limit_per_minute
-        self._call_timestamps: dict[str, list[float]] = {}
-        self._emergency_stop = False
+    def check_injection(self, text: str, user_id: str = "") -> tuple[bool, str]:
+        if len(text) > 2000:
+            return True, "输入过长"
 
-    def is_allowed(self, user_id: str) -> tuple[bool, str]:
-        if self._emergency_stop:
-            return False, "紧急熔断已启用"
-        if self.owner_ids and user_id not in self.owner_ids and not user_id.startswith("cli"):
-            return False, f"用户 {user_id} 不在白名单中"
-        if not self._check_rate(user_id):
-            return False, "频率超限，请稍后再试"
-        return True, ""
+        if _injection_re.search(text):
+            self._record_suspicious(user_id)
+            self._warned_count += 1
+            logger.warning("security.injection_detected", user=user_id, text_preview=text[:100])
+            return True, "检测到可疑内容"
 
-    def check_content(self, text: str) -> tuple[bool, str]:
-        if not text:
-            return True, ""
-        normalized_text = unicodedata.normalize('NFKC', text)
-        lower = normalized_text.lower()
-        for pattern in self.PROMPT_INJECTION_PATTERNS:
-            if pattern.lower() in lower:
-                logger.warning("security.prompt_injection_detected", pattern=pattern)
-                return False, "检测到可疑内容模式"
-        return True, ""
+        if self._check_frequency(user_id):
+            self._blocked_count += 1
+            logger.warning("security.frequency_blocked", user=user_id)
+            return True, "请求过于频繁，请稍后再试"
 
-    def _check_rate(self, user_id: str) -> bool:
+        return False, ""
+
+    def _record_suspicious(self, user_id: str):
+        if not user_id:
+            return
         now = time.time()
-        window = 60
-        timestamps = self._call_timestamps.get(user_id, [])
-        timestamps = [t for t in timestamps if now - t < window]
-        self._call_timestamps[user_id] = timestamps
-        if len(timestamps) >= self.rate_limit:
+        if user_id not in _suspicious_counts:
+            _suspicious_counts[user_id] = []
+        _suspicious_counts[user_id].append(now)
+        _suspicious_counts[user_id] = [t for t in _suspicious_counts[user_id] if now - t < _BLOCK_WINDOW]
+
+    def _check_frequency(self, user_id: str) -> bool:
+        if not user_id:
             return False
-        timestamps.append(now)
-        return True
+        now = time.time()
+        if user_id not in _suspicious_counts:
+            return False
+        recent = [t for t in _suspicious_counts[user_id] if now - t < _BLOCK_WINDOW]
+        return len(recent) >= _BLOCK_THRESHOLD
 
-    def emergency_stop(self):
-        self._emergency_stop = True
-
-    def emergency_resume(self):
-        self._emergency_stop = False
-
-    def is_owner(self, user_id: str) -> bool:
-        if user_id.startswith("cli"):
-            return True
-        return bool(self.owner_ids) and user_id in self.owner_ids
-
-    @property
-    def is_stopped(self) -> bool:
-        return self._emergency_stop
+    def get_stats(self) -> dict:
+        return {
+            "blocked": self._blocked_count,
+            "warned": self._warned_count,
+        }
