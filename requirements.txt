@@ -1,0 +1,12 @@
+python-dotenv
+loguru
+openai>=1.0
+aiosqlite
+qq-botpy
+duckduckgo-search
+pydantic
+pdfplumber
+python-docx
+python-pptx
+openpyxl
+html2text

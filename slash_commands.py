@@ -1,0 +1,426 @@
+import time
+from loguru import logger
+
+
+OWNER_ONLY_COMMANDS = {"/model", "/reset", "/agent"}
+
+
+class SlashCommandHandler:
+
+    def __init__(self, db=None, router=None, context=None,
+                 memory=None, learning_manager=None,
+                 notebook_manager=None, security=None, agent=None):
+        self._db = db
+        self._router = router
+        self._context = context
+        self._memory = memory
+        self._learning = learning_manager
+        self._notebook = notebook_manager
+        self._security = security
+        self._agent = agent
+        self._start_time = time.time()
+
+    def is_slash_command(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped.startswith("/"):
+            return False
+        if stripped.startswith("//"):
+            return False
+        return True
+
+    def is_owner_command(self, command: str) -> bool:
+        return command.split()[0] in OWNER_ONLY_COMMANDS
+
+    def _is_owner(self, user_id: str) -> bool:
+        return self._security and self._security.is_owner(user_id)
+
+    async def handle(self, text: str, user_id: str = "") -> str | None:
+        parts = text.strip().split(maxsplit=1)
+        command = parts[0].lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if self.is_owner_command(command):
+            if not self._security or not self._security.is_owner(user_id):
+                return "这个命令只有主人才能用哦～"
+
+        handlers = {
+            "/cost": self._cmd_cost,
+            "/status": self._cmd_status,
+            "/model": self._cmd_model,
+            "/forget": self._cmd_forget,
+            "/reset": self._cmd_reset,
+            "/learn": self._cmd_learn,
+            "/note": self._cmd_note,
+            "/help": self._cmd_help,
+            "/voice": self._cmd_voice,
+            "/agent": self._cmd_agent,
+            "/hw": self._cmd_hw,
+            "/sys": self._cmd_sys,
+            "/cam": self._cmd_cam,
+        }
+
+        handler = handlers.get(command)
+        if handler:
+            try:
+                return await handler(args, user_id)
+            except Exception as e:
+                logger.warning("slash.handle_error", command=command, error=str(e))
+                if self._agent and hasattr(self._agent, '_error_handler') and self._agent._error_handler:
+                    try:
+                        smart_reply = await self._agent._error_handler.handle_error_with_intelligence(
+                            error=e, user_query=text, context=f"执行命令 /{command} 参数: {args}"
+                        )
+                        return smart_reply
+                    except Exception:
+                        pass
+                return f"执行 /{command} 时出了点问题：{str(e)[:100]}"
+
+        return await self._cmd_help("", user_id)
+
+    async def _cmd_cost(self, args: str, user_id: str) -> str:
+        if not self._db:
+            return "数据库还没准备好呢～"
+
+        daily = await self._db.analytics.get_daily_cost()
+        lines = ["📊 今日 API 消耗"]
+
+        if daily["call_count"] == 0:
+            return "今天还没有 API 调用哦～"
+
+        cost_cny = daily["total_cost_usd"] * 7.2
+        lines.append(f"💰 花费: ${daily['total_cost_usd']:.4f} (≈¥{cost_cny:.2f})")
+        lines.append(f"📞 调用次数: {daily['call_count']}")
+        lines.append(f"📥 输入: {daily['total_prompt_tokens']:,} tokens")
+        lines.append(f"📤 输出: {daily['total_completion_tokens']:,} tokens")
+
+        if daily["cache_hit_ratio"] > 0:
+            lines.append(f"🎯 缓存命中率: {daily['cache_hit_ratio']:.1%}")
+
+        if args in ("7d", "week"):
+            breakdown = await self._db.analytics.get_cost_breakdown(days=7)
+            if breakdown:
+                lines.append("\n📋 近7天按类型:")
+                for b in breakdown[:5]:
+                    lines.append(f"  {b['task_type']}: ${b['total_cost']:.4f} ({b['call_count']}次)")
+
+        return "\n".join(lines)
+
+    async def _cmd_status(self, args: str, user_id: str) -> str:
+        lines = ["🌿 纳西妲状态报告"]
+
+        uptime = time.time() - self._start_time
+        hours = int(uptime // 3600)
+        minutes = int((uptime % 3600) // 60)
+        lines.append(f"⏰ 运行时间: {hours}h{minutes}m")
+
+        if self._router:
+            stats = self._router.get_cache_stats()
+            label = self._router.get_model_preference_label()
+            lines.append(f"🤖 模型: {label}")
+            lines.append(f"📞 API调用: {stats['total_calls']}次")
+            if stats["hit_tokens"] + stats["miss_tokens"] > 0:
+                lines.append(f"🎯 缓存命中率: {stats['hit_ratio']:.1%}")
+
+        if self._db:
+            mem_count = await self._db.memory.get_episodic_count()
+            lines.append(f"🧠 记忆条数: {mem_count}")
+
+            daily = await self._db.analytics.get_daily_cost()
+            if daily["call_count"] > 0:
+                cost_cny = daily["total_cost_usd"] * 7.2
+                lines.append(f"💰 今日花费: ${daily['total_cost_usd']:.4f} (≈¥{cost_cny:.2f})")
+
+        if self._context:
+            lines.append(f"💬 对话轮数: {len(self._context.history) // 2}")
+
+        if self._learning:
+            additions = await self._learning.get_system_prompt_additions()
+            if additions:
+                count = additions.count("·")
+                lines.append(f"📚 学习规则: {count}条")
+
+        return "\n".join(lines)
+
+    async def _cmd_model(self, args: str, user_id: str) -> str:
+        if not self._router:
+            return "路由器还没准备好呢～"
+
+        if args in ("mimo",):
+            self._router.set_model_preference("mimo")
+            if self._agent and hasattr(self._agent, 'klee'):
+                self._agent.klee.set_preferred_provider("mimo")
+            return "已切换到 MiMo 模式 🍊（使用小米 MiMo-V2.5）"
+        elif args in ("mimo-pro", "pro", "mimo_pro"):
+            self._router.set_model_preference("mimo-pro")
+            if self._agent and hasattr(self._agent, 'klee'):
+                self._agent.klee.set_preferred_provider("mimo")
+            return "已切换到 MiMo Pro 模式 🧠（使用小米 MiMo-V2.5-Pro 深度思考）"
+        else:
+            pref = self._router.get_model_preference()
+            label = self._router.get_model_preference_label()
+            return f"当前: {label}\n用法: /model [mimo|mimo-pro]"
+
+    async def _cmd_forget(self, args: str, user_id: str) -> str:
+        if not self._context:
+            return "上下文还没准备好呢～"
+
+        cleared = len(self._context.history)
+        self._context.history.clear()
+        self._context.memory_retrieval = None
+        self._context.emotion_hint = ""
+
+        return f"已清除 {cleared} 条短期对话记忆～\n（情景记忆和画像还在哦，那些是人家珍贵的回忆）"
+
+    async def _cmd_reset(self, args: str, user_id: str) -> str:
+        if not self._context:
+            return "上下文还没准备好呢～"
+
+        self._context.clear()
+        self._context.invalidate_dynamic_cache()
+
+        return "对话上下文已重置！人家会从头开始认识你的～"
+
+    async def _cmd_learn(self, args: str, user_id: str) -> str:
+        if not self._db:
+            return "数据库还没准备好呢～"
+
+        promoted = await self._db.learning.get_promoted_learnings()
+        all_learnings = await self._db.learning.search_learnings(limit=10)
+
+        lines = []
+        if promoted:
+            lines.append("📚 已学习的经验:")
+            for i, l in enumerate(promoted[:5], 1):
+                summary = l.get("summary", "")[:60]
+                count = l.get("recurrence_count", 1)
+                lines.append(f"{i}. {summary} (×{count})")
+
+        if all_learnings and len(all_learnings) > len(promoted):
+            pending = [l for l in all_learnings if l.get("status") == "pending"]
+            if pending:
+                lines.append(f"\n📝 待确认的学习 ({len(pending)} 条):")
+                for i, l in enumerate(pending[:5], 1):
+                    summary = l.get("summary", "")[:60]
+                    lines.append(f"{i}. {summary}")
+
+        if not lines:
+            return "人家还没有学到什么特别的经验呢～"
+
+        return "\n".join(lines)
+
+    async def _cmd_note(self, args: str, user_id: str) -> str:
+        if not self._db:
+            return "数据库还没准备好呢～"
+
+        notes = await self._db.notebook.get_notebook_notes(limit=10)
+        tasks = await self._db.notebook.get_pending_tasks(limit=5)
+
+        lines = []
+        if notes:
+            lines.append("📓 笔记:")
+            for i, n in enumerate(notes[:10], 1):
+                kind = n.get("kind", "note")
+                content = n.get("content", "")[:50]
+                icon = "📌" if kind == "task" else "📝"
+                lines.append(f"{i}. {icon} {content}")
+
+        if tasks:
+            lines.append(f"\n⏰ 待办 ({len(tasks)} 项):")
+            for i, t in enumerate(tasks[:5], 1):
+                content = t.get("content", "")[:40]
+                due = t.get("due_date", 0)
+                if due and due > 0:
+                    import datetime
+                    ds = datetime.datetime.fromtimestamp(due).strftime("%m/%d %H:%M")
+                    lines.append(f"{i}. {content} @ {ds}")
+                else:
+                    lines.append(f"{i}. {content}")
+
+        if not lines:
+            return "笔记本还是空的呢～"
+
+        return "\n".join(lines)
+
+    async def _cmd_voice(self, args: str, user_id: str) -> str:
+        if not self._is_owner(user_id):
+            return "只有主人才能切换语音模式哦～"
+        if not self._agent:
+            return "Agent 还没准备好呢～"
+        if args in ("on", "开", "1", "true"):
+            self._agent.set_voice_mode(True)
+            return "语音模式已开启 🎤（回复将附带语音）"
+        elif args in ("off", "关", "0", "false"):
+            self._agent.set_voice_mode(False)
+            return "语音模式已关闭 🔇（仅文字回复）"
+        else:
+            mode = self._agent.get_voice_mode()
+            status = "开启 🎤" if mode else "关闭 🔇"
+            return f"语音模式: {status}\n用法: /voice [on|off]"
+
+    async def _cmd_agent(self, args: str, user_id: str) -> str:
+        if not self._agent:
+            return "Agent 还没准备好呢～"
+
+        agents = self._agent.dispatcher.list_agents()
+
+        if not args:
+            target = self._agent.get_chat_target(user_id)
+            target_display = "纳西妲" if target == "nahida" else target
+            lines = [f"当前对话目标: {target_display}"]
+            if agents:
+                lines.append("可用子Agent:")
+                for a in agents:
+                    lines.append(f"  · {a['display_name']}（/agent {a['display_name']}）")
+            lines.append("  · 纳西妲（/agent 纳西妲）")
+            return "\n".join(lines)
+
+        if args in ("纳西妲", "nahida"):
+            self._agent.set_chat_target(user_id, "nahida")
+            return "已切换到纳西妲 🌿"
+
+        for a in agents:
+            if args in (a["display_name"], a["name"]):
+                self._agent.set_chat_target(user_id, a["name"])
+                return f"已切换到{a['display_name']} 🔥"
+
+        return f"没找到叫「{args}」的Agent哦～\n用法: /agent [名称]"
+
+    async def _cmd_hw(self, args: str, user_id: str) -> str:
+        if not self._db:
+            return "数据库还没准备好呢～"
+        lines = ["🖥️ 香橙派硬件状态"]
+        try:
+            import os
+            temp_path = "/sys/class/thermal/thermal_zone0/temp"
+            try:
+                with open(temp_path) as f:
+                    temp_c = int(f.read().strip()) / 1000
+                temp_icon = "🌡️"
+                if temp_c > 80:
+                    temp_icon = "🔥⚠️"
+                elif temp_c > 60:
+                    temp_icon = "🌡️"
+                lines.append(f"{temp_icon} CPU温度: {temp_c:.1f}°C")
+            except Exception:
+                lines.append("🌡️ CPU温度: 无法读取")
+            try:
+                freq_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+                with open(freq_path) as f:
+                    freq_khz = int(f.read().strip())
+                lines.append(f"⚡ CPU频率: {freq_khz // 1000} MHz")
+            except Exception:
+                lines.append("⚡ CPU频率: 无法读取")
+            try:
+                with open("/proc/meminfo") as f:
+                    meminfo = f.read()
+                mem_total = int([l for l in meminfo.split('\n') if 'MemTotal' in l][0].split()[1])
+                mem_avail = int([l for l in meminfo.split('\n') if 'MemAvailable' in l][0].split()[1])
+                mem_used = mem_total - mem_avail
+                mem_pct = mem_used / mem_total * 100
+                mem_icon = "💾"
+                if mem_pct > 90:
+                    mem_icon = "💾⚠️"
+                lines.append(f"{mem_icon} 内存: {mem_used//1024}M / {mem_total//1024}M ({mem_pct:.0f}%)")
+            except Exception:
+                lines.append("💾 内存: 无法读取")
+            try:
+                stat = os.statvfs('/')
+                total = stat.f_blocks * stat.f_frsize
+                free = stat.f_bavail * stat.f_frsize
+                used = total - free
+                pct = used / total * 100 if total > 0 else 0
+                lines.append(f"💿 磁盘: {used//1073741824}G / {total//1073741824}G ({pct:.0f}%)")
+            except Exception:
+                lines.append("💿 磁盘: 无法读取")
+            try:
+                with open("/proc/loadavg") as f:
+                    load = f.read().strip().split()[:3]
+                lines.append(f"📊 负载: {' '.join(load)}")
+            except Exception:
+                lines.append("📊 负载: 无法读取")
+        except Exception:
+            pass
+        return "\n".join(lines)
+
+    async def _cmd_sys(self, args: str, user_id: str) -> str:
+        lines = ["📋 系统运行状态"]
+        uptime = time.time() - self._start_time
+        hours = int(uptime // 3600)
+        minutes = int((uptime % 3600) // 60)
+        lines.append(f"⏰ Agent运行: {hours}h{minutes}m")
+        if self._agent and hasattr(self._agent, '_error_handler') and self._agent._error_handler:
+            recent = self._agent._error_handler._recent_errors
+            if recent:
+                last = recent[-1]
+                lines.append(f"⚠️ 最近错误: {last.error_type} - {last.error_message[:60]}")
+            else:
+                lines.append("✅ 最近无错误")
+        else:
+            lines.append("✅ 错误监控: 未启用")
+        try:
+            import subprocess
+            result = subprocess.run(["systemctl", "is-active", "nahida-bot"], capture_output=True, text=True, timeout=5)
+            status = result.stdout.strip() or "未知"
+            status_icon = "🟢" if status == "active" else "🔴"
+            lines.append(f"{status_icon} nahida-bot: {status}")
+        except Exception:
+            lines.append("🔘 nahida-bot: 状态未知")
+        if self._router:
+            label = self._router.get_model_preference_label()
+            from model_router import ROUTE_TABLE
+            model_id = ROUTE_TABLE.get("chat", {}).get("model", "unknown")
+            lines.append(f"🤖 当前模型: {label} ({model_id})")
+        return "\n".join(lines)
+
+    async def _cmd_cam(self, args: str, user_id: str) -> str:
+        try:
+            from vision_service import VisionService
+            vs = VisionService()
+            ok, frame = vs.capture_frame(device=0)
+            if not ok:
+                return f"📷 摄像头不可用: {frame}"
+            if args.strip() == "snap":
+                path = vs.save_frame(frame)
+                h, w = frame.shape[:2]
+                return f"📸 已拍照保存\n分辨率: {w}x{h}\n路径: {path}"
+            description = vs.describe_scene(frame)
+            colors = vs.analyze_colors(frame)
+            color_str = ", ".join([f"{c.color}({c.percentage:.0f}%)" for c in colors[:3]])
+            path = vs.save_frame(frame)
+            return f"📷 摄像头画面分析\n{description}\n主色调: {color_str}\n图片已保存: {path}"
+        except Exception as e:
+            return f"📷 摄像头操作失败: {str(e)[:100]}"
+
+    async def _cmd_help(self, args: str, user_id: str) -> str:
+        is_owner = self._security and self._security.is_owner(user_id)
+
+        lines = ["🌿 纳西妲的命令列表\n"]
+
+        public_cmds = [
+            ("/cost [7d]", "查看API消耗（加7d看7天）"),
+            ("/status", "查看Agent状态"),
+            ("/forget", "清除短期对话记忆"),
+            ("/learn", "查看学习记录"),
+            ("/note", "查看笔记本"),
+            ("/hw", "查看香橙派硬件状态"),
+            ("/cam", "拍照并分析摄像头画面（/cam snap仅拍照）"),
+            ("/sys", "查看系统运行状态"),
+            ("/help", "显示此帮助"),
+        ]
+
+        owner_cmds = [
+            ("/model [mimo|mimo-pro]", "切换模型模式"),
+            ("/reset", "重置对话上下文"),
+            ("/voice [on|off]", "切换语音模式"),
+            ("/agent [名称]", "切换对话目标Agent"),
+        ]
+
+        for cmd, desc in public_cmds:
+            lines.append(f"  {cmd} — {desc}")
+
+        if is_owner:
+            lines.append("\n👑 主人专属:")
+            for cmd, desc in owner_cmds:
+                lines.append(f"  {cmd} — {desc}")
+
+        return "\n".join(lines)
