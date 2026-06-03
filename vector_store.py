@@ -113,17 +113,22 @@ class VectorStore:
         if cached:
             return cached
 
-        try:
-            response = await self._embed_client.embeddings.create(
-                model=self._embed_model,
-                input=text,
-            )
-            vec = response.data[0].embedding
-            self._cache.put(text, vec)
-            return vec
-        except Exception as e:
-            logger.warning("vector_store.embed_failed", error=str(e))
-            return []
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self._embed_client.embeddings.create(
+                    model=self._embed_model,
+                    input=text,
+                )
+                vec = response.data[0].embedding
+                self._cache.put(text, vec)
+                return vec
+            except Exception as e:
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
+                logger.warning("vector_store.embed_failed", error=str(e), attempts=max_retries + 1)
+                return []
 
     async def upsert(self, row_id: int, text: str) -> bool:
         if not self._initialized or not self._vec_conn:

@@ -1,15 +1,18 @@
 import json
 import re
+import time
 from loguru import logger
 from text_utils import has_dsml_tool_calls, parse_dsml_tool_calls as _parse_dsml
 
 
 class ToolCallRepair:
 
+    STORM_TTL = 120
+
     def __init__(self, allowed_tool_names: set[str] | None = None, storm_window: int = 3):
         self._allowed_tools = allowed_tool_names or set()
         self._storm_window = storm_window
-        self._recent_calls: list[tuple[str, str]] = []
+        self._recent_calls: list[tuple[str, str, float]] = []
 
     def _parse_dsml_tool_calls(self, text: str) -> list[dict]:
         return _parse_dsml(text, self._allowed_tools)
@@ -88,9 +91,14 @@ class ToolCallRepair:
             return None
 
     def detect_storm(self, tool_name: str, arguments: str) -> bool:
+        now = time.time()
+        cutoff = now - self.STORM_TTL
+        self._recent_calls = [(n, a, t) for n, a, t in self._recent_calls if t > cutoff]
+
         call_key = (tool_name, arguments)
-        is_storm = call_key in self._recent_calls[-self._storm_window:]
-        self._recent_calls.append(call_key)
+        recent_keys = [(n, a) for n, a, t in self._recent_calls[-self._storm_window:]]
+        is_storm = call_key in recent_keys
+        self._recent_calls.append((tool_name, arguments, now))
 
         if len(self._recent_calls) > self._storm_window * 2:
             self._recent_calls = self._recent_calls[-self._storm_window * 2:]

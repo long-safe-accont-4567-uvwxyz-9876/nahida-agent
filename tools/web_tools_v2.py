@@ -1,5 +1,7 @@
 import os
 import json
+import time
+from loguru import logger
 from tool_registry import register_tool, ToolPermission, ToolResult
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
@@ -66,27 +68,51 @@ def _format_results(query: str, results: list[dict], engine_name: str = "") -> s
     return "\n".join(parts)
 
 
+def _dedup_results(results: list[dict]) -> list[dict]:
+    seen_urls = set()
+    unique = []
+    for r in results:
+        url = r.get("url", "")
+        if url and url in seen_urls:
+            continue
+        seen_urls.add(url)
+        unique.append(r)
+    return unique
+
+
 def _do_search(query: str, max_results: int = 8, use_tavily: bool = True) -> tuple[list[dict], str]:
     results = _bing_search_sync(query, max_results)
     if results:
-        return results, "Bing"
+        return _dedup_results(results), "Bing"
+
+    time.sleep(1)
+    results = _bing_search_sync(query, max_results)
+    if results:
+        return _dedup_results(results), "Bing"
 
     if use_tavily and TAVILY_API_KEY:
         try:
             results = _tavily_search_sync(query, max_results)
             if results:
-                return results, "Tavily"
+                return _dedup_results(results), "Tavily"
         except Exception:
             pass
+    elif use_tavily and not TAVILY_API_KEY:
+        logger.debug("tavily.not_configured")
 
     return [], ""
 
 
 def _clean_query(query: str) -> str:
     q = query.strip()
+    question_starters = ("如何", "为什么", "什么是", "怎么", "怎样", "哪儿", "哪里", "谁", "何时", "多少")
+    if q.startswith(question_starters):
+        for s in ["吗", "呢", "吧", "啊", "呀", "哦"]:
+            if q.endswith(s) and len(q) > 2:
+                q = q[:-len(s)].strip()
+        return q if q.strip() else query.strip()
     prefixes = ["获取", "帮我", "搜一下", "搜索一下", "查一下", "找一下", "可以", "能不能",
-                "我要", "我想知道", "我想", "请帮我", "麻烦", "能否", "可不可以",
-                "最新的", "网上", "今天", "最近", "当前"]
+                "我要", "我想知道", "我想", "请帮我", "麻烦", "能否", "可不可以"]
     suffixes = ["吗", "呢", "吧", "啊", "呀", "哦"]
     for p in prefixes:
         if q.startswith(p):

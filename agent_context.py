@@ -11,14 +11,17 @@ def estimate_tokens(text: str) -> int:
 
 class AgentContext:
 
-    MAX_HISTORY_TOKENS = 4000
+    MAX_HISTORY_TOKENS = 6000
     SYSTEM_PROMPT_TOKENS_BUDGET = 2000
     DYNAMIC_CACHE_TTL = 600
     PORTRAIT_CACHE_TTL = 1800
+    COMPRESS_RATIO = 0.6
 
-    def __init__(self, system_prompt: str = "", system_prompt_loader: Callable[[], str] | None = None):
+    def __init__(self, system_prompt: str = "", system_prompt_loader: Callable[[], str] | None = None,
+                 router=None):
         self.system_prompt = system_prompt
         self._system_prompt_loader = system_prompt_loader
+        self._router = router
         self.history: list[dict] = []
         self.memory_retrieval: list[dict] | None = None
         self.emotion_hint: str = ""
@@ -35,9 +38,11 @@ class AgentContext:
         self._cached_learned: str = ""
         self._learned_cache_ts: float = 0.0
         self._restored_summary: str = ""
+        self._compressed_summary: str = ""
+        self._compress_count: int = 0
 
     def add_message(self, role: str, content: str, **kwargs):
-        msg = {"role": role, "content": content}
+        msg = {"role": role, "content": str(content) if content is not None else ""}
         if kwargs.get("reasoning_content"):
             msg["reasoning_content"] = kwargs["reasoning_content"]
         if kwargs.get("tool_calls"):
@@ -47,9 +52,92 @@ class AgentContext:
         self._trim_history()
 
     def _trim_history(self):
-        while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
-            removed = self.history.pop(0)
-            logger.debug("context.trimmed", role=removed["role"], preview=removed["content"][:40])
+        if not self.history or self._history_tokens() <= self.MAX_HISTORY_TOKENS:
+            return
+
+        preserve_count = min(10, len(self.history))
+        compressible = self.history[:len(self.history) - preserve_count]
+
+        if not compressible:
+            while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
+                removed = self.history.pop(0)
+                logger.debug("context.trimmed", role=removed["role"], preview=removed["content"][:40])
+            return
+
+        compress_count = max(1, int(len(compressible) * self.COMPRESS_RATIO))
+        to_compress = compressible[:compress_count]
+        remaining_compressible = compressible[compress_count:]
+        preserved = self.history[len(self.history) - preserve_count:]
+
+        summary = self._summarize_messages(to_compress)
+        if summary:
+            self._compressed_summary = (
+                f"{self._compressed_summary}\n{summary}" if self._compressed_summary else summary
+            )
+            self._compress_count += 1
+            self.history = remaining_compressible + preserved
+            logger.info("context.compressed", compressed=compress_count, summary_len=len(summary))
+        else:
+            while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
+                removed = self.history.pop(0)
+                logger.debug("context.trimmed", role=removed["role"], preview=removed["content"][:40])
+
+    def _summarize_messages(self, messages: list[dict]) -> str:
+        if not messages or not self._router:
+            return ""
+
+        lines = []
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if not content:
+                continue
+            prefix = {"user": "用户", "assistant": "纳西妲", "tool": "工具结果"}.get(role, role)
+            lines.append(f"{prefix}: {content[:120]}")
+
+        if not lines:
+            return ""
+
+        text = "\n".join(lines)
+        if len(text) > 2000:
+            text = text[:2000]
+
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                return self._quick_summarize(messages)
+
+            result = loop.run_until_complete(
+                self._router.route(
+                    "chat_flash",
+                    [
+                        {"role": "system", "content": "请将以下对话记录压缩为1-2句话的摘要，保留关键信息和上下文。只输出摘要，不要加任何前缀。"},
+                        {"role": "user", "content": text},
+                    ],
+                    temperature=0.3,
+                    max_tokens=200,
+                )
+            )
+            if isinstance(result, str) and result.strip():
+                return result.strip()
+            return self._quick_summarize(messages)
+        except Exception as e:
+            logger.debug("context.summarize_failed", error=str(e))
+            return self._quick_summarize(messages)
+
+    def _quick_summarize(self, messages: list[dict]) -> str:
+        lines = []
+        for m in messages:
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if not content or role == "tool":
+                continue
+            prefix = {"user": "用户", "assistant": "纳西妲"}.get(role, role)
+            lines.append(f"{prefix}: {content[:80]}")
+        if not lines:
+            return ""
+        return "；".join(lines[:10])
 
     def _history_tokens(self) -> int:
         return sum(estimate_tokens(m["content"]) for m in self.history)
@@ -63,6 +151,9 @@ class AgentContext:
             return self._cached_dynamic_prompt
 
         parts = []
+
+        if self._compressed_summary:
+            parts.append(f"[已压缩的早期对话摘要（仅供参考，不需要回应）]\n{self._compressed_summary}")
 
         if self._restored_summary:
             parts.append(f"[近期对话摘要（仅供参考，不需要回应）]\n{self._restored_summary}")
@@ -109,7 +200,12 @@ class AgentContext:
         messages = [{"role": "system", "content": system_content}]
 
         for msg in self.history:
-            messages.append(msg)
+            m = {"role": msg["role"], "content": str(msg.get("content", "")) if msg.get("content") is not None else ""}
+            if msg.get("tool_calls"):
+                m["tool_calls"] = msg["tool_calls"]
+            if msg.get("reasoning_content"):
+                m["reasoning_content"] = msg["reasoning_content"]
+            messages.append(m)
 
         user_block = user_input
         parts = []
@@ -176,3 +272,5 @@ class AgentContext:
         self.user_portrait = None
         self.notebook_focus = None
         self.pending_tasks = None
+        self._compressed_summary = ""
+        self._compress_count = 0

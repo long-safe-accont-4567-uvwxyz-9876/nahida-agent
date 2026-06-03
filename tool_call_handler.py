@@ -124,6 +124,10 @@ class ToolCallHandler:
             exec_results = await asyncio.gather(*exec_tasks, return_exceptions=True)
             for er in exec_results:
                 if isinstance(er, Exception):
+                    trace.warning("tool.exec_exception", error=str(er)[:200])
+                    continue
+                if not isinstance(er, (tuple, list)) or len(er) != 4:
+                    trace.warning("tool.unexpected_result", type=type(er).__name__)
                     continue
                 tcid, res, rtext, dname = er
                 tool_results.append(res)

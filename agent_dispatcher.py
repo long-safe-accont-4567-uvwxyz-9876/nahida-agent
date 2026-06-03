@@ -144,7 +144,9 @@ class SubAgent:
             result_text = json.dumps(result.data, ensure_ascii=False) if not isinstance(result.data, str) else result.data
         else:
             result_text = f"错误: {result.error}"
-        return result_text[:2000]
+        if len(result_text) > 4000:
+            result_text = result_text[:4000] + f"\n...(结果过长已截断，共{len(result_text)}字符)"
+        return result_text
 
     def _is_reasoning_model(self) -> bool:
         model = self.config.model.lower()
@@ -233,40 +235,43 @@ class SubAgent:
 
                 if tools and self._tool_executor and has_dsml_tool_calls(content):
                     dsml_calls = parse_dsml_tool_calls(content, tool_names)
-                    if dsml_calls:
-                        clean_content = strip_dsml(content)
-                        msg_rc = getattr(msg, "reasoning_content", None) or ""
-                        assistant_msg = {
-                            "role": "assistant",
-                            "content": clean_content,
-                            "tool_calls": dsml_calls,
-                        }
-                        if msg_rc:
-                            assistant_msg["reasoning_content"] = msg_rc
-                        working.append(assistant_msg)
+                    if not dsml_calls:
+                        logger.warning("sub_agent.dsml_parse_failed", name=self.config.name)
+                        logger.info("sub_agent.chat.ok", name=self.config.name, model=self.config.model, rounds=round_idx)
+                        return content.strip()
+                    clean_content = strip_dsml(content)
+                    msg_rc = getattr(msg, "reasoning_content", None) or ""
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": clean_content,
+                        "tool_calls": dsml_calls,
+                    }
+                    if msg_rc:
+                        assistant_msg["reasoning_content"] = msg_rc
+                    working.append(assistant_msg)
 
-                        for tc in dsml_calls:
-                            tool_name = tc["function"]["name"]
-                            args_str = tc["function"]["arguments"]
+                    for tc in dsml_calls:
+                        tool_name = tc["function"]["name"]
+                        args_str = tc["function"]["arguments"]
 
-                            if self._tool_repair:
-                                repaired = self._tool_repair.repair_truncation(args_str)
-                                if repaired:
-                                    args_str = repaired
+                        if self._tool_repair:
+                            repaired = self._tool_repair.repair_truncation(args_str)
+                            if repaired:
+                                args_str = repaired
 
-                            try:
-                                args = json.loads(args_str)
-                            except json.JSONDecodeError:
-                                args = {}
+                        try:
+                            args = json.loads(args_str)
+                        except json.JSONDecodeError:
+                            args = {}
 
-                            result = await self._tool_executor.execute(tool_name, args)
-                            result_text = await self._handle_tool_result(tool_name, result)
+                        result = await self._tool_executor.execute(tool_name, args)
+                        result_text = await self._handle_tool_result(tool_name, result)
 
-                            working.append({
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": result_text,
-                            })
+                        working.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_text,
+                        })
 
                         continue
 

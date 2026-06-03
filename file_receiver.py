@@ -30,7 +30,7 @@ class FileReceiver:
     TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".log", ".py", ".js", ".html", ".css", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sh", ".bat"}
 
     ALLOWED_DOMAINS = {
-        "qq.com", "qpic.cn", "myqcloud.com",
+        "qq.com", "qq.com.cn", "qpic.cn", "myqcloud.com",
         "gtimg.cn", "qlogo.cn",
     }
 

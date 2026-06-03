@@ -107,7 +107,7 @@ class AgentCore:
         _owner_ids = os.getenv("OWNER_IDS", "").split(",")
         _owner_ids = [x.strip() for x in _owner_ids if x.strip()]
         self.security = SecurityFilter(owner_ids=_owner_ids)
-        self.context = AgentContext(system_prompt_loader=build_system_prompt)
+        self.context = AgentContext(system_prompt_loader=build_system_prompt, router=self.router)
         self.tool_executor = ToolExecutor(db=self.db)
         self.tool_repair = ToolCallRepair(
             allowed_tool_names=set(t["function"]["name"] for t in to_openai_tools())
@@ -287,11 +287,14 @@ class AgentCore:
                       source: str = "qq",
                       user_openid: str = "",
                       session_id: str = "",
-                      status_callback=None) -> ProcessResult:
+                      status_callback=None,
+                      image_data: list[dict] | None = None) -> ProcessResult:
         if not self._initialized:
             return ProcessResult(reply=DEGRADED_REPLY)
 
         self._status_callback = status_callback
+        if self._tool_call_handler:
+            self._tool_call_handler._tool_repair.clear_storm_window()
 
         trace = logger.bind(trace_id=f"{int(time.time()*1000)%1000000:06d}")
         trace.info("agent.process.start", source=source, user_id=user_id,
@@ -314,6 +317,9 @@ class AgentCore:
         chat_targets = self._parse_chat_target(user_input, user_id)
         clean_input = re.sub(r'@[可莉纳西妲]+', '', user_input).strip()
 
+        voice_intent = self._detect_voice_intent(clean_input)
+        force_voice = voice_intent and not self._voice_mode
+
         if not clean_input:
             target_name = "可莉" if chat_targets and chat_targets[0] == "keli" else "纳西妲"
             confirm_msg = f"好～现在跟{target_name}说话啦！有什么想聊的呀？"
@@ -325,13 +331,15 @@ class AgentCore:
             if len(non_nahida_targets) == 1:
                 return await self._dispatch_single_sub_agent(
                     non_nahida_targets[0], clean_input, user_id, source, session_id, trace,
+                    force_voice=force_voice,
                 )
             else:
                 return await self._dispatch_parallel_sub_agents(
                     non_nahida_targets, clean_input, user_id, source, session_id, trace,
+                    force_voice=force_voice,
                 )
 
-        if "nahida" in chat_targets and self._task_graph and not self._is_manual_target(user_input, user_id) and not self._is_simple_task(clean_input):
+        if "nahida" in chat_targets and self._task_graph and not self._is_manual_target(user_input, user_id) and not self._is_simple_task(clean_input) and not force_voice and not image_data and not ("[图片:" in user_input and "已保存到" in user_input):
             try:
                 graph_result = await run_task_graph(
                     graph=self._task_graph,
@@ -353,13 +361,16 @@ class AgentCore:
                     clean_reply = self.klee_sticker_manager.strip_emotion_tag(graph_result.final_output)
                     sticker_path = None
                     audio_path = None
-                    if self._voice_mode and len(clean_reply) > 2:
+                    should_generate_voice = self._voice_mode or force_voice
+                    if should_generate_voice and len(clean_reply) > 2:
                         try:
                             target_agent = self.dispatcher.get_agent(graph_result.route_target)
                             if target_agent:
-                                audio_path = await target_agent.synthesize(clean_reply)
+                                audio_path = await target_agent.synthesize(self._clean_reply(clean_reply))
                         except Exception as e:
                             logger.warning("agent.routed_tts_failed", error=str(e))
+                    if audio_path:
+                        clean_reply = clean_reply + "\n\n🎙️ 语音消息已发送～"
                     return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path)
             except Exception as e:
                 logger.warning("agent.task_graph_failed", error=str(e))
@@ -389,6 +400,53 @@ class AgentCore:
 
         messages = self.context.build_messages(user_input)
 
+        if image_data:
+            logger.info("agent.vision_start", image_count=len(image_data), total_b64_size=sum(len(img.get('data', '')) for img in image_data))
+            image_description = await self._describe_images(image_data)
+            if image_description:
+                messages.append({
+                    "role": "system",
+                    "content": f"用户发送了一张图片，图片内容识别结果如下：\n{image_description}\n\n请用你自己的语气和人格风格，自然地向用户描述你看到了什么，不要直接复述识别结果，不要提及视觉模型或识别工具。"
+                })
+            else:
+                messages.append({
+                    "role": "system",
+                    "content": "用户发送了一张图片，但视觉识别未能成功识别图片内容。请诚实地告诉用户你暂时看不清这张图片，不要编造图片内容，可以请用户描述一下图片里是什么。"
+                })
+        elif "[图片:" in user_input and "已保存到" in user_input:
+            img_path_match = re.search(r'已保存到\s+([^\s，。]+)', user_input)
+            if img_path_match:
+                img_path = img_path_match.group(1)
+                try:
+                    import base64 as b64mod
+                    p = Path(img_path)
+                    if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
+                        mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+                        mime = mime_map.get(p.suffix.lower(), "image/jpeg")
+                        img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
+                        image_description = await self._describe_images([{"mimeType": mime, "data": img_b64}])
+                        if image_description:
+                            messages.append({
+                                "role": "system",
+                                "content": f"用户发送了一张图片，图片内容识别结果如下：\n{image_description}\n\n请用你自己的语气和人格风格，自然地向用户描述你看到了什么，不要直接复述识别结果，不要提及视觉模型或识别工具。"
+                            })
+                        else:
+                            messages.append({
+                                "role": "system",
+                                "content": "用户发送了一张图片，但视觉识别未能成功识别图片内容。请诚实地告诉用户你暂时看不清这张图片，不要编造图片内容，可以请用户描述一下图片里是什么。"
+                            })
+                    else:
+                        messages.append({
+                            "role": "system",
+                            "content": "[系统提示] 用户发送了一张图片，但图片文件无法读取。请告诉用户你暂时无法查看这张图片。"
+                        })
+                except Exception as e:
+                    logger.warning("agent.image_load_failed", error=str(e))
+                    messages.append({
+                        "role": "system",
+                        "content": "[系统提示] 用户发送了一张图片，但图片加载失败。请告诉用户你暂时无法查看这张图片。"
+                    })
+
         _sticker_keywords = ["表情包", "表情", "贴纸", "sticker", "贴图"]
         _sticker_intent = any(kw in clean_input for kw in _sticker_keywords)
         _pre_picked_sticker = None
@@ -407,6 +465,10 @@ class AgentCore:
                 })
 
         tools = to_openai_tools() if to_openai_tools() else None
+
+        has_image = image_data or ("[图片:" in user_input and "已保存到" in user_input)
+        if has_image and tools:
+            tools = None
 
         should_escalate, reason = self._should_escalate_to_pro(user_input, tools)
         base_task = "chat_pro" if should_escalate else "chat"
@@ -462,10 +524,11 @@ class AgentCore:
                 msg = result.choices[0].message
                 if msg.tool_calls:
                     tc_list = [
-                        {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        {"id": str(tc.id), "type": "function", "function": {"name": tc.function.name, "arguments": str(tc.function.arguments) if tc.function.arguments else "{}"}}
                         for tc in msg.tool_calls
                     ]
                     reasoning = getattr(msg, "reasoning_content", None)
+                    self.router.pop_reasoning_content()  # clear stale value since we extract directly
                     reply, tool_results = await self._handle_tool_calls(
                         tc_list, messages, trace,
                         assistant_content=msg.content or "",
@@ -503,7 +566,8 @@ class AgentCore:
 
         if not self._handled_by_tool_call:
             self.context.add_message("user", user_input)
-            self.context.add_message("assistant", reply)
+            rc = self.router.pop_reasoning_content()
+            self.context.add_message("assistant", reply, reasoning_content=rc)
 
         asyncio.create_task(self._background_tasks(
             user_input, reply, user_id, source, emotion, tool_results,
@@ -525,11 +589,15 @@ class AgentCore:
             clean_reply, sticker_path = self.get_sticker_info(reply, self._last_user_emotion)
 
         audio_path = None
-        if self._voice_mode and self.tts.available and len(clean_reply) > 2:
+        should_generate_voice = self._voice_mode or force_voice
+        if should_generate_voice and self.tts.available and len(clean_reply) > 2:
             try:
-                audio_path = await self.tts.synthesize_nahida(clean_reply)
+                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply))
             except Exception as e:
                 logger.warning("agent.tts_failed", error=str(e))
+
+        if audio_path:
+            clean_reply = clean_reply + "\n\n🎙️ 语音消息已发送～"
 
         return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path, tool_results=tool_results)
 
@@ -666,14 +734,16 @@ class AgentCore:
         return clean_reply, sticker_path
 
     async def _dispatch_single_sub_agent(self, target: str, clean_input: str,
-                                          user_id: str, source: str, session_id: str, trace) -> ProcessResult:
+                                          user_id: str, source: str, session_id: str, trace,
+                                          force_voice: bool = False) -> ProcessResult:
         sub_agent = self.dispatcher.get_agent(target)
         if not sub_agent or not sub_agent.available:
             return ProcessResult(reply=f"{sub_agent.config.display_name if sub_agent else target}现在有点累了...等会儿再来吧！💤")
 
         display_name = sub_agent.config.display_name
         trace.info("agent.chat_target_sub", target=target, input_preview=clean_input[:50])
-        sub_reply = await self.dispatcher.dispatch(target, clean_input, status_callback=self._status_callback)
+        context_str = self._build_sub_agent_context()
+        sub_reply = await self.dispatcher.dispatch(target, clean_input, context=context_str, status_callback=self._status_callback)
         if sub_reply is None:
             sub_reply = f"{display_name}现在有点累了...等会儿再来吧！💤"
 
@@ -717,16 +787,21 @@ class AgentCore:
         sticker_path = None
 
         sub_audio_path = None
-        if self._voice_mode and len(clean_sub_reply) > 2:
+        should_generate_voice = self._voice_mode or force_voice
+        if should_generate_voice and len(clean_sub_reply) > 2:
             try:
-                sub_audio_path = await sub_agent.synthesize(clean_sub_reply)
+                sub_audio_path = await sub_agent.synthesize(self._clean_reply(clean_sub_reply))
             except Exception as e:
                 logger.warning("agent.sub_tts_failed", target=target, error=str(e))
+
+        if sub_audio_path:
+            clean_sub_reply = clean_sub_reply + "\n\n🎙️ 语音消息已发送～"
 
         return ProcessResult(reply=clean_sub_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=sub_audio_path)
 
     async def _dispatch_parallel_sub_agents(self, targets: list[str], clean_input: str,
-                                            user_id: str, source: str, session_id: str, trace) -> ProcessResult:
+                                            user_id: str, source: str, session_id: str, trace,
+                                            force_voice: bool = False) -> ProcessResult:
         trace.info("agent.parallel_dispatch", targets=targets, input_preview=clean_input[:50])
 
         if self._status_callback:
@@ -736,6 +811,7 @@ class AgentCore:
                 pass
 
         agent_configs = self._agent_route_configs
+        sub_context = self._build_sub_agent_context()
         sub_tasks = {}
         for t in targets:
             desc = agent_configs.get(t, {}).get("route_description", t)
@@ -748,7 +824,7 @@ class AgentCore:
                 return {"agent": t, "display_name": display_name, "reply": f"{display_name}暂时不可用", "error": True}
             try:
                 reply = await asyncio.wait_for(
-                    self.dispatcher.dispatch(t, sub_tasks.get(t, clean_input), status_callback=None),
+                    self.dispatcher.dispatch(t, sub_tasks.get(t, clean_input), context=sub_context, status_callback=None),
                     timeout=180,
                 )
                 if reply is None:
@@ -808,11 +884,15 @@ class AgentCore:
         clean_reply, sticker_path = self.get_sticker_info(all_replies, self._last_user_emotion)
 
         audio_path = None
-        if self._voice_mode and self.tts.available and len(clean_reply) > 2:
+        should_generate_voice = self._voice_mode or force_voice
+        if should_generate_voice and self.tts.available and len(clean_reply) > 2:
             try:
-                audio_path = await self.tts.synthesize_nahida(clean_reply)
+                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply))
             except Exception as e:
                 logger.warning("agent.parallel_tts_failed", error=str(e))
+
+        if audio_path:
+            clean_reply = clean_reply + "\n\n🎙️ 语音消息已发送～"
 
         return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path)
 
@@ -825,6 +905,30 @@ class AgentCore:
         if result is None:
             return "可莉现在有点累了...等会儿再来找大哥哥玩吧！蹦蹦...💤"
         return result
+
+    def _build_sub_agent_context(self) -> str:
+        parts = []
+        recent = self.context.get_last_n(4)
+        if recent:
+            conv_lines = []
+            for m in recent:
+                role = m.get("role", "")
+                content = m.get("content", "")
+                if not content or role == "tool":
+                    continue
+                prefix = {"user": "用户", "assistant": "纳西妲"}.get(role, role)
+                conv_lines.append(f"{prefix}: {content[:80]}")
+            if conv_lines:
+                parts.append("[近期对话]\n" + "\n".join(conv_lines))
+
+        if self.context._compressed_summary:
+            parts.append(f"[早期对话摘要]\n{self.context._compressed_summary[:300]}")
+
+        portrait = self.context.user_portrait
+        if portrait:
+            parts.append(f"[用户画像]\n{portrait[:200]}")
+
+        return "\n\n".join(parts) if parts else ""
 
     async def _rephrase_as_nahida(self, user_input: str, klee_result: str) -> str:
         try:
@@ -861,21 +965,79 @@ class AgentCore:
             "搜索", "查一下", "帮我查", "找一下", "搜一下", "查查", "帮我找",
             "搜索一下", "查资料", "搜资料", "写代码", "编程", "调试",
             "研究", "分析", "计算", "执行", "运行", "安装", "部署",
-            "翻译", "转换", "生成", "制作", "设计",
+            "翻译", "转换", "制作", "设计",
             "怎么看", "怎么弄", "如何", "怎么办", "帮我看", "帮我看看",
             "检查", "巡检", "测试", "优化", "修复", "bug", "报错",
         ]
         if any(kw in user_input for kw in complex_keywords):
             return False
 
+        # 对话性消息关键词 — 这些是日常聊天，不是复杂任务
+        chat_keywords = [
+            "这是", "那是", "这个是", "那个是", "不是", "不对", "错了",
+            "你好", "谢谢", "晚安", "早安", "早上好", "晚上好",
+            "哈哈", "嘿嘿", "嗯嗯", "好的", "好吧", "算了",
+            "你知道吗", "告诉你", "跟你说", "我说",
+        ]
+        if any(kw in user_input for kw in chat_keywords):
+            return True
+
         cn_chars = sum(1 for c in user_input if '\u4e00' <= c <= '\u9fff')
         effective_len = cn_chars * 2 + len(user_input) - cn_chars
-        if effective_len <= 15:
+        if effective_len <= 20:
             return True
         simple_tool_patterns = ["天气", "气温", "时间", "几点", "日期", "星期", "翻译"]
         if effective_len <= 25 and any(kw in user_input for kw in simple_tool_patterns):
             return True
         return False
+
+    def _detect_voice_intent(self, user_input: str) -> bool:
+        voice_keywords = [
+            "语音", "声音", "说话", "朗读", "念给我", "读给我",
+            "用声音", "听你", "听听你", "发语音", "生成语音",
+            "语音回复", "语音消息", "说给我听", "念出来",
+            "tts", "voice",
+        ]
+        q = user_input.lower()
+        return any(kw in q for kw in voice_keywords)
+
+    async def _describe_images(self, image_data: list[dict]) -> str:
+        """使用 MiMo Vision API 识别图片内容"""
+        try:
+            if not self.router or not self.router._client:
+                logger.warning("agent.vision_no_client")
+                return ""
+
+            vision_parts = [{"type": "text", "text": "请详细描述这张图片的内容。如果有文字，请完整转录。如果是题目，请给出题目内容。"}]
+            for i, img in enumerate(image_data):
+                b64_data = img.get('data', '')
+                mime = img.get('mimeType', 'image/jpeg')
+                logger.info("agent.vision_image", index=i, mime=mime, b64_len=len(b64_data))
+                if not b64_data:
+                    logger.warning("agent.vision_empty_data", index=i)
+                    continue
+                vision_parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64_data}"
+                    }
+                })
+
+            if len(vision_parts) <= 1:
+                logger.warning("agent.vision_no_valid_images")
+                return ""
+
+            response = await self.router._client.chat.completions.create(
+                model=MIMO_MODEL,
+                messages=[{"role": "user", "content": vision_parts}],
+                max_tokens=800,
+            )
+            description = response.choices[0].message.content.strip()
+            logger.info("agent.image_described", length=len(description))
+            return description
+        except Exception as e:
+            logger.warning("agent.image_describe_failed", error=str(e))
+            return ""
 
     async def _nahida_synthesis_chat(self, prompt: str) -> str:
         try:
@@ -921,6 +1083,31 @@ class AgentCore:
             return targets
 
         q = user_input.lower()
+
+        negative_patterns = [
+            r"(?:不|别|不要|不用)\s*(?:让|叫|请)?\s*(?:可莉|klee|银狼|yinlang|昔涟|xilian|尼可|nike)",
+        ]
+        for pat in negative_patterns:
+            if re.search(pat, q):
+                self._user_chat_target[user_id] = "nahida"
+                return ["nahida"]
+
+        self_target_patterns = [
+            (r"(?:你|你自己|亲自)(?:去|来|帮我|帮我查|查|搜|找|看看|检查)", "nahida"),
+        ]
+        for pattern, target in self_target_patterns:
+            if re.search(pattern, q):
+                self._user_chat_target[user_id] = target
+                return [target]
+
+        voice_patterns = [
+            r"(?:语音|声音|说话|朗读|念|读|听你|听听|发语音|生成语音|语音回复|说给我听|念出来)",
+        ]
+        for pattern in voice_patterns:
+            if re.search(pattern, q):
+                self._user_chat_target[user_id] = "nahida"
+                return ["nahida"]
+
         patterns = [
             (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:银狼|yinlang)", "yinlang"),
             (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:可莉|klee|小炸弹)", "keli"),
@@ -937,7 +1124,7 @@ class AgentCore:
                 self._user_chat_target[user_id] = target
                 return [target]
 
-        return [self._user_chat_target.get(user_id, "nahida")]
+        return ["nahida"]
 
     def get_chat_target(self, user_id: str) -> str:
         return self._user_chat_target.get(user_id, "nahida")

@@ -17,8 +17,20 @@ VOICE_REFERENCES = {
 }
 
 VOICE_STYLES = {
-    "nahida": "温柔可爱的少女音，语调轻柔甜美，偶尔带点俏皮，像草神纳西妲在说话",
-    "keli": "活泼开朗的少女音，语调上扬欢快，充满活力，像火花骑士可莉在说话",
+    "nahida": (
+        "角色：纳西妲，原神中的草神，外表是可爱的小女孩，内心却承载着五百年的智慧与孤独。"
+        "声音清亮稚嫩，带着少女特有的轻盈感，语速适中偏慢，说话温柔但偶尔会流露出超越年龄的深沉。"
+        "语调轻柔甜美，尾音微微上扬带点俏皮，像是在和最亲近的人说话。"
+        "偶尔会在句末加一点小感叹，表现出孩子气的好奇心。"
+        "发声位置偏前，音色通透空灵，像微风拂过草叶般轻盈。"
+    ),
+    "keli": (
+        "角色：可莉，原神中的火花骑士，活泼开朗的小女孩。"
+        "声音明亮高亢，充满童真和活力，语速偏快，经常兴奋地提高音量。"
+        "语调上扬欢快，像炸鸡一样充满能量，说话时带着笑意。"
+        "偶尔会突然压低声音说悄悄话，然后又开心地大笑起来。"
+        "咬字轻快，尾音喜欢拖长，像在撒娇。"
+    ),
 }
 
 _cache: dict[str, str] = {}
@@ -111,18 +123,28 @@ class TTSEngine:
 
         context = style or VOICE_STYLES.get(voice, "")
 
+        style_tag = ""
+        if voice == "nahida":
+            style_tag = "(温柔 甜美) "
+        elif voice == "keli":
+            style_tag = "(活泼 开心) "
+
         messages = []
         if context:
             messages.append({"role": "user", "content": context})
-        messages.append({"role": "assistant", "content": text})
+        else:
+            voice_style = VOICE_STYLES.get(voice, "")
+            if voice_style:
+                messages.append({"role": "user", "content": voice_style})
+        messages.append({"role": "assistant", "content": style_tag + text})
 
         try:
             completion = await self._client.chat.completions.create(
                 model=MIMO_TTS_MODEL,
                 messages=messages,
                 audio={
-                    "format": "mp3",
-                    "voice": voice_data_url,
+                    "format": "wav",
+                "voice": voice_data_url,
                 },
             )
 
@@ -137,7 +159,7 @@ class TTSEngine:
                 out = Path(output_path)
             else:
                 ts = int(time.time() * 1000) % 1000000
-                out = self._output_dir / f"{voice}_{ts}.mp3"
+                out = self._output_dir / f"{voice}_{ts}.wav"
 
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_bytes(audio_bytes)

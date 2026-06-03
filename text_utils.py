@@ -82,12 +82,28 @@ DSML_LEFTOVER = re.compile(
     r'<｜｜DSML｜｜[^>]*>',
     re.DOTALL,
 )
+FAKE_XML_TOOL_PATTERN = re.compile(
+    r'<function=\w+>.*?</function>|'
+    r'<parameter=\w+>.*?</parameter>|'
+    r'<(read_file|write_file|list_files|search_files|vision_analyze|camera_capture|'
+    r'multi_search|web_browse|shell_command|python_executor|document_reader|'
+    r'save_memory|recall_memory|search_memory|nudge|get_hardware_info|'
+    r'control_gpio|read_sensor|wolfram_query|analyze_code|run_code|edit_code|'
+    r'create_file|arg)\b[^>]*/?>.*?</\1>|'
+    r'<(read_file|write_file|list_files|search_files|vision_analyze|camera_capture|'
+    r'multi_search|web_browse|shell_command|python_executor|document_reader|'
+    r'save_memory|recall_memory|search_memory|nudge|get_hardware_info|'
+    r'control_gpio|read_sensor|wolfram_query|analyze_code|run_code|edit_code|'
+    r'create_file|arg)\b[^>]*/>',
+    re.DOTALL,
+)
 
 
 def strip_dsml(text: str) -> str:
     text = DSML_PATTERN.sub('', text)
     text = DSML_INVOKE_PATTERN.sub('', text)
     text = DSML_LEFTOVER.sub('', text)
+    text = FAKE_XML_TOOL_PATTERN.sub('', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 

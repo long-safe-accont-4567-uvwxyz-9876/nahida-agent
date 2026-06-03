@@ -248,6 +248,7 @@ class AIQQBot(botpy.Client):
         content = message.content.strip()
 
         attachment_info = ""
+        image_data = []
         if hasattr(message, 'attachments') and message.attachments:
             parts = []
             for att in message.attachments:
@@ -258,7 +259,21 @@ class AIQQBot(botpy.Client):
                     if result.get("text_preview"):
                         parts.append(f"[文件: {fn}]\n内容预览:\n{result['text_preview'][:500]}")
                     else:
-                        parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
+                        if ct.startswith("image/"):
+                            save_path = result.get('save_path', '')
+                            parts.append(f"[图片: {fn}，已保存到 {save_path}]")
+                            try:
+                                import base64 as b64mod
+                                p = Path(save_path)
+                                if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
+                                    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+                                    mime = mime_map.get(p.suffix.lower(), "image/jpeg")
+                                    img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
+                                    image_data.append({"mimeType": mime, "data": img_b64})
+                            except Exception as e:
+                                logger.warning("qq_bot.image_encode_failed", error=str(e))
+                        else:
+                            parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
                 else:
                     if ct.startswith("image/"):
                         parts.append(f"[图片: {fn or 'image'}]")
@@ -302,7 +317,8 @@ class AIQQBot(botpy.Client):
 
             result = await self.agent.process(user_input, user_id=user_id, source="qq_c2c",
                                               user_openid=user_openid, session_id=session_id,
-                                              status_callback=status_notify)
+                                              status_callback=status_notify,
+                                              image_data=image_data if image_data else None)
             if result.reply:
                 await self._send_reply_with_sticker(message, result)
         except Exception as e:
@@ -316,6 +332,7 @@ class AIQQBot(botpy.Client):
         content = message.content.strip()
 
         attachment_info = ""
+        image_data = []
         if hasattr(message, 'attachments') and message.attachments:
             parts = []
             for att in message.attachments:
@@ -326,7 +343,21 @@ class AIQQBot(botpy.Client):
                     if result.get("text_preview"):
                         parts.append(f"[文件: {fn}]\n内容预览:\n{result['text_preview'][:500]}")
                     else:
-                        parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
+                        if ct.startswith("image/"):
+                            save_path = result.get('save_path', '')
+                            parts.append(f"[图片: {fn}，已保存到 {save_path}]")
+                            try:
+                                import base64 as b64mod
+                                p = Path(save_path)
+                                if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
+                                    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+                                    mime = mime_map.get(p.suffix.lower(), "image/jpeg")
+                                    img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
+                                    image_data.append({"mimeType": mime, "data": img_b64})
+                            except Exception as e:
+                                logger.warning("qq_bot.image_encode_failed", error=str(e))
+                        else:
+                            parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
                 else:
                     if ct.startswith("image/"):
                         parts.append(f"[图片: {fn or 'image'}]")
@@ -360,7 +391,8 @@ class AIQQBot(botpy.Client):
 
             result = await self.agent.process(user_input, user_id=user_id, source="qq_group",
                                               user_openid=member_openid,
-                                              status_callback=status_notify)
+                                              status_callback=status_notify,
+                                              image_data=image_data if image_data else None)
             if result.reply:
                 await self._send_reply_with_sticker(message, result)
         except Exception as e:
@@ -486,22 +518,67 @@ class AIQQBot(botpy.Client):
                 logger.warning("qq_bot.audio_send_failed", error=str(e))
 
     async def _send_audio(self, message, audio_path: Path):
-        if isinstance(message, C2CMessage):
-            openid = message.author.user_openid
-            file_info = await self._upload_c2c_base64(openid, audio_path, file_type=3)
-            await self.api.post_c2c_message(
-                openid=openid, msg_id=message.id,
-                msg_type=7, content="",
-                media={"file_info": file_info}, msg_seq=_next_msg_seq()
-            )
-        elif isinstance(message, GroupMessage):
-            group_openid = message.group_openid
-            file_info = await self._upload_group_base64(group_openid, audio_path, file_type=3)
-            await self.api.post_group_message(
-                group_openid=group_openid, msg_id=message.id,
-                msg_type=7, content="",
-                media={"file_info": file_info}, msg_seq=_next_msg_seq()
-            )
+        try:
+            silk_path = await self._convert_to_silk(audio_path)
+            if silk_path is None:
+                logger.warning("qq_bot.silk_convert_failed", path=str(audio_path))
+                return
+
+            if isinstance(message, C2CMessage):
+                openid = message.author.user_openid
+                file_info = await self._upload_c2c_base64(openid, silk_path, file_type=3)
+                await self.api.post_c2c_message(
+                    openid=openid, msg_id=message.id,
+                    msg_type=7, content="",
+                    media={"file_info": file_info}, msg_seq=_next_msg_seq()
+                )
+            elif isinstance(message, GroupMessage):
+                group_openid = message.group_openid
+                file_info = await self._upload_group_base64(group_openid, silk_path, file_type=3)
+                await self.api.post_group_message(
+                    group_openid=group_openid, msg_id=message.id,
+                    msg_type=7, content="",
+                    media={"file_info": file_info}, msg_seq=_next_msg_seq()
+                )
+        except Exception as e:
+            logger.warning("qq_bot.audio_send_error", error=str(e))
+
+    async def _convert_to_silk(self, audio_path: Path) -> Path | None:
+        try:
+            import pilk
+            import subprocess
+
+            pcm_path = audio_path.with_suffix('.pcm')
+            silk_path = audio_path.with_suffix('.silk')
+
+            def _do_convert():
+                result = subprocess.run(
+                    ['ffmpeg', '-y', '-i', str(audio_path), '-ar', '16000', '-ac', '1', '-f', 's16le', str(pcm_path)],
+                    capture_output=True, text=True, timeout=30
+                )
+                if result.returncode != 0:
+                    logger.warning("qq_bot.ffmpeg_failed", stderr=result.stderr[:200])
+                    return False
+                pilk.encode(str(pcm_path), str(silk_path), pcm_rate=16000, tencent=True)
+                return True
+
+            ok = await asyncio.to_thread(_do_convert)
+
+            if ok and silk_path.exists() and silk_path.stat().st_size > 0:
+                logger.info("qq_bot.silk_convert_ok", input=str(audio_path), output=str(silk_path),
+                            size_kb=silk_path.stat().st_size // 1024)
+                try:
+                    pcm_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return silk_path
+            return None
+        except ImportError:
+            logger.warning("qq_bot.pilk_not_installed")
+            return None
+        except Exception as e:
+            logger.warning("qq_bot.silk_convert_failed", error=str(e))
+            return None
 
 
 if __name__ == "__main__":

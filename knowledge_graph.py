@@ -98,8 +98,12 @@ class KnowledgeGraph:
                 if not isinstance(parsed, dict):
                     return {"entities": [], "relations": []}
                 parsed = _normalize_json_keys(parsed)
-                entities = parsed.get("entities", [])
-                relations = parsed.get("relations", [])
+                try:
+                    entities = parsed.get("entities", [])
+                    relations = parsed.get("relations", [])
+                except (KeyError, TypeError):
+                    entities = []
+                    relations = []
                 if not isinstance(entities, list):
                     entities = []
                 if not isinstance(relations, list):

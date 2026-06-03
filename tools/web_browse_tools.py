@@ -1,10 +1,45 @@
+import time
 from urllib.parse import urlparse
 import ssl
+from loguru import logger
 from tool_registry import register_tool, ToolPermission, ToolResult
 
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode = ssl.CERT_NONE
+
+_CONTENT_LIMIT = 8000
+
+
+def _fetch_html(url: str, timeout: int = 15) -> tuple[int, str, str]:
+    try:
+        import primp
+        client = primp.Client(impersonate="chrome")
+        resp = client.get(url, headers={
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        })
+        if resp.status_code >= 400:
+            return resp.status_code, "", f"HTTP 错误: {resp.status_code}"
+        return resp.status_code, resp.text, ""
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("web_browse.primp_failed", error=str(e))
+
+    import urllib.request
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as response:
+        if response.status >= 400:
+            return response.status, "", f"HTTP 错误: {response.status} {response.reason}"
+        html = response.read().decode("utf-8", errors="ignore")
+    return response.status, html, ""
 
 
 @register_tool(
@@ -23,24 +58,15 @@ _ssl_ctx.verify_mode = ssl.CERT_NONE
 )
 def web_browse(url: str) -> ToolResult:
     try:
-        import urllib.request
-
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-        )
-
-        with urllib.request.urlopen(req, timeout=15, context=_ssl_ctx) as response:
-            if response.status >= 400:
-                return ToolResult.fail(f"HTTP 错误: {response.status} {response.reason}")
-            html = response.read().decode("utf-8", errors="ignore")
+        status, html, error = _fetch_html(url)
+        if error:
+            time.sleep(2)
+            status, html, error = _fetch_html(url)
+            if error:
+                return ToolResult.fail(f"浏览网页失败: {error}")
 
         try:
             import html2text
@@ -56,8 +82,8 @@ def web_browse(url: str) -> ToolResult:
         title = _extract_title(html)
         header = f"网页: {title}\nURL: {url}\n{'='*40}\n"
 
-        if len(text) > 5000:
-            text = text[:5000] + "\n...(内容过长已截断)"
+        if len(text) > _CONTENT_LIMIT:
+            text = text[:_CONTENT_LIMIT] + "\n...(内容过长已截断)"
 
         return ToolResult.ok(header + text)
     except Exception as e:
@@ -78,7 +104,7 @@ def _simple_html_to_text(html: str) -> str:
     text = re.sub(r'&lt;', '<', text)
     text = re.sub(r'&gt;', '>', text)
     text = re.sub(r'\n\s*\n', '\n\n', text)
-    return text.strip()[:5000]
+    return text.strip()[:_CONTENT_LIMIT]
 
 
 def _extract_title(html: str) -> str:

@@ -189,25 +189,29 @@ class PortraitManager:
 
         source_ids = ",".join(str(m.get("id", "")) for m in memories[:15])
 
-        try:
-            await self.memory.insert_portrait(
-                content=portrait_text,
-                version=version,
-                source_ids=source_ids,
-                change_log=changes,
-            )
-            logger.info(
-                "portrait.consolidated",
-                version=version,
-                length=len(portrait_text),
-                changes=changes[:80] if changes else "",
-            )
-            self._dirty = False
-        except Exception as e:
-            logger.error("portrait.db_write_failed", error=str(e))
-            return None
-
-        return portrait_text
+        for attempt in range(3):
+            try:
+                await self.memory.insert_portrait(
+                    content=portrait_text,
+                    version=version,
+                    source_ids=source_ids,
+                    change_log=changes,
+                )
+                logger.info(
+                    "portrait.consolidated",
+                    version=version,
+                    length=len(portrait_text),
+                    changes=changes[:80] if changes else "",
+                )
+                self._dirty = False
+                return portrait_text
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    import asyncio
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.error("portrait.db_write_failed", error=str(e))
+                return None
 
     async def ensure_exists(self) -> str | None:
         existing = await self.memory.get_latest_portrait()
