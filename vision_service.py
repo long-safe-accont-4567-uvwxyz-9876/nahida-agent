@@ -97,7 +97,7 @@ class VisionService:
     def _load_model(self):
         if self.model_loaded:
             return
-        if False:
+        if os.getenv("ENABLE_NPU", "").lower() in ("1", "true", "yes"):
             try:
                 from npu_inference import NPUInference
                 if NPUInference.is_available():

@@ -3,21 +3,15 @@ import sys
 import ssl
 import asyncio
 import base64
+import threading
 import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 load_dotenv()
 
-_original_create_default_context = ssl.create_default_context
-
-def _patched_create_default_context(*args, **kwargs):
-    ctx = _original_create_default_context(*args, **kwargs)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
-
-ssl.create_default_context = _patched_create_default_context
+# 安全加固：不再全局 monkey patch ssl.create_default_context
+# botpy 内部已使用 SSLContext() 处理 WebSocket SSL，无需全局禁用证书验证
 
 from logging_config import setup_logging
 setup_logging()
@@ -33,13 +27,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent_core import AgentCore, ProcessResult
 from config import AGENT_CONFIG
 from nudge_engine import NudgeEngine
+from text_utils import encode_image_to_base64
 
 _original_is_system_event = BotWebSocket._is_system_event
 
 async def _patched_is_system_event(self, message_event, ws):
     event_op = message_event.get("op")
     if event_op == BotWebSocket.WS_HEARTBEAT_ACK:
-        self._last_heartbeat_ack = asyncio.get_event_loop().time()
+        self._last_heartbeat_ack = asyncio.get_running_loop().time()
     return await _original_is_system_event(self, message_event, ws)
 
 BotWebSocket._is_system_event = _patched_is_system_event
@@ -49,7 +44,7 @@ _original_send_heart = BotWebSocket._send_heart
 async def _patched_send_heart(self, interval):
     _log = __import__("botpy.logging", fromlist=["get_logger"]).get_logger()
     _log.info("[botpy] 心跳维持启动（带超时检测）...")
-    self._last_heartbeat_ack = asyncio.get_event_loop().time()
+    self._last_heartbeat_ack = asyncio.get_running_loop().time()
     missed_acks = 0
     while True:
         if self._conn is None:
@@ -59,23 +54,25 @@ async def _patched_send_heart(self, interval):
             _log.debug("[botpy] ws连接已关闭, 心跳检测停止")
             return
 
-        now = asyncio.get_event_loop().time()
-        if now - self._last_heartbeat_ack > interval * 2.5:
-            missed_acks += 1
-            _log.warning(f"[botpy] 心跳ACK超时 ({missed_acks}次), 上次ACK: {int(now - self._last_heartbeat_ack)}秒前")
-            if missed_acks >= 2:
-                _log.warning("[botpy] 心跳ACK连续超时，强制断开重连!")
-                await self._conn.close()
-                return
-        else:
-            missed_acks = 0
-
+        # 先发送心跳
         payload = {
             "op": self.WS_HEARTBEAT,
             "d": self._session["last_seq"],
         }
         await self.send_msg(__import__("json").dumps(payload))
         await asyncio.sleep(interval)
+
+        # 再检查 ACK 是否超时
+        now = asyncio.get_running_loop().time()
+        if now - self._last_heartbeat_ack > interval * 4:
+            missed_acks += 1
+            _log.warning(f"[botpy] 心跳ACK超时 ({missed_acks}次), 上次ACK: {int(now - self._last_heartbeat_ack)}秒前")
+            if missed_acks >= 3:
+                _log.warning("[botpy] 心跳ACK连续超时，强制断开重连!")
+                await self._conn.close()
+                return
+        else:
+            missed_acks = 0
 
 BotWebSocket._send_heart = _patched_send_heart
 
@@ -179,30 +176,90 @@ _qq_cfg = AGENT_CONFIG.get("qq_bot", {})
 MAX_REPLY_LEN = _qq_cfg.get("max_reply_length", 8000)
 
 _msg_seq_counter = int(time.time() * 1000) % (10 ** 8)
+_msg_seq_lock = threading.Lock()
 
 def _next_msg_seq() -> int:
     global _msg_seq_counter
-    _msg_seq_counter += 1
-    return _msg_seq_counter
+    with _msg_seq_lock:
+        _msg_seq_counter += 1
+        return _msg_seq_counter
+
+
+# 当前活跃的 bot 实例（同进程内 GreetingScheduler 等主动消息入口使用）
+_ACTIVE_BOT: "AIQQBot | None" = None
+
+
+async def send_proactive_message(text: str, openid: str = "") -> bool:
+    """向最近私聊用户（或指定 openid）主动发一条 QQ 消息。
+
+    供 web/greeting_scheduler 等同进程模块调用；QQ client 未连接时返回 False。
+    """
+    bot = _ACTIVE_BOT
+    if bot is None or bot.is_closed():
+        raise RuntimeError("QQ client 未连接")
+    target = openid or bot._last_c2c_openid
+    if not target:
+        raise RuntimeError("没有可用的 QQ 用户 openid（等用户先发一条私聊，或设置 NUDGE_USER_OPENID）")
+    await bot.api.post_c2c_message(
+        openid=target, content=text, msg_type=0, msg_seq=_next_msg_seq())
+    logger.info("qq_bot.proactive_sent openid={} text={}", target[:8], text[:40])
+    return True
+
+
+async def run_qq_bot(agent: "AgentCore", *, sandbox: bool = False) -> None:
+    """在现有事件循环中运行 QQ client（与 WebUI 同进程模式）。
+
+    内部带指数退避重连；任务被取消时干净退出。
+    """
+    if not APP_ID or APP_ID == "your_app_id_here":
+        logger.warning("qq_bot.disabled_no_appid")
+        return
+    intents = botpy.Intents(public_messages=True)
+    delay = 5
+    while True:
+        client = AIQQBot(intents=intents, is_sandbox=sandbox, timeout=30, agent=agent)
+        try:
+            await client.start(appid=APP_ID, secret=APP_SECRET)
+            logger.warning("qq_bot.exited_reconnecting")
+            delay = 5
+        except asyncio.CancelledError:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            logger.error("qq_bot.crashed_retrying error={} delay={}", str(e)[:200], delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120)
 
 
 class AIQQBot(botpy.Client):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, agent: "AgentCore | None" = None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.agent = AgentCore()
+        # 支持注入共享的 AgentCore（与 WebUI 同进程同实例），未注入则自建（独立运行模式）
+        self.agent = agent or AgentCore()
+        self._agent_shared = agent is not None
         self.nudge_engine = None
-        self._processed_msg_ids = set()
-        self._MAX_MSG_IDS = 100
-        self._agent_initialized = False
+        # 消息去重缓存：msg_id → 时间戳，保留最近 1 小时
+        self._processed_msg_ids: dict[str, float] = {}
+        self._MSG_ID_TTL = 3600  # 1 小时
+        self._agent_initialized = agent is not None and getattr(agent, "_initialized", False)
+        # 最近一个私聊用户 openid，主动消息（问候同步）发给该用户
+        self._last_c2c_openid: str = os.getenv("NUDGE_USER_OPENID", "")
+        global _ACTIVE_BOT
+        _ACTIVE_BOT = self
 
     def _is_duplicate_msg(self, msg_id: str) -> bool:
+        now = time.time()
+        # 清理过期项
+        expired = [k for k, ts in self._processed_msg_ids.items() if now - ts > self._MSG_ID_TTL]
+        for k in expired:
+            del self._processed_msg_ids[k]
+        # 检查重复
         if msg_id in self._processed_msg_ids:
             return True
-        self._processed_msg_ids.add(msg_id)
-        if len(self._processed_msg_ids) > self._MAX_MSG_IDS:
-            excess = len(self._processed_msg_ids) - self._MAX_MSG_IDS
-            for _ in range(excess):
-                self._processed_msg_ids.pop()
+        self._processed_msg_ids[msg_id] = now
         return False
 
     async def on_ready(self):
@@ -243,12 +300,27 @@ class AIQQBot(botpy.Client):
 
     async def on_close(self, close_status_code, close_msg):
         logger.warning("qq_bot.ws_closed", code=close_status_code, msg=str(close_msg)[:100])
+        # 注意：不在 on_close 中调用 agent.shutdown()
+        # 因为 on_close 在临时断开时也会触发，而外层重连循环会复用同一实例
+        # shutdown 会释放数据库等资源，导致重连后 Agent 不可用
+        # shutdown 应在程序真正退出时调用
 
-    async def on_c2c_message_create(self, message: C2CMessage):
-        content = message.content.strip()
+    async def _process_message_attachments(self, message) -> tuple[list[dict], str]:
+        """处理消息中的附件，返回图片数据和附件描述文本。
 
-        attachment_info = ""
+        遍历消息附件，接收文件、编码图片为 base64，生成附件描述文本。
+        C2C 消息和群消息的附件处理逻辑完全一致，提取此方法消除重复。
+
+        Args:
+            message: QQ Bot 消息对象（C2CMessage 或 GroupMessage）
+
+        Returns:
+            tuple[list[dict], str]: (image_data, attachment_info)
+                image_data: 图片的 mimeType+base64 列表，供视觉识别使用
+                attachment_info: 附件描述文本，拼接到用户输入中
+        """
         image_data = []
+        attachment_info = ""
         if hasattr(message, 'attachments') and message.attachments:
             parts = []
             for att in message.attachments:
@@ -263,13 +335,10 @@ class AIQQBot(botpy.Client):
                             save_path = result.get('save_path', '')
                             parts.append(f"[图片: {fn}，已保存到 {save_path}]")
                             try:
-                                import base64 as b64mod
-                                p = Path(save_path)
-                                if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
-                                    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
-                                    mime = mime_map.get(p.suffix.lower(), "image/jpeg")
-                                    img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
-                                    image_data.append({"mimeType": mime, "data": img_b64})
+                                mime, img_b64 = encode_image_to_base64(save_path)
+                                image_data.append({"mimeType": mime, "data": img_b64})
+                            except (FileNotFoundError, ValueError):
+                                pass
                             except Exception as e:
                                 logger.warning("qq_bot.image_encode_failed", error=str(e))
                         else:
@@ -282,6 +351,12 @@ class AIQQBot(botpy.Client):
                     else:
                         parts.append(f"[附件: {fn or 'unknown'}]")
             attachment_info = " ".join(str(p) for p in parts)
+        return image_data, attachment_info
+
+    async def on_c2c_message_create(self, message: C2CMessage):
+        content = message.content.strip()
+
+        image_data, attachment_info = await self._process_message_attachments(message)
 
         if not content and not attachment_info:
             return
@@ -290,6 +365,8 @@ class AIQQBot(botpy.Client):
 
         user_openid = getattr(message.author, 'user_openid', '') if hasattr(message, 'author') else ''
         user_id = f"qq_{user_openid}" if user_openid else "qq_unknown"
+        if user_openid:
+            self._last_c2c_openid = user_openid
         logger.info("qq_bot.c2c_message", user_id=user_id, openid=user_openid, content=user_input[:80])
 
         if self.nudge_engine:
@@ -302,8 +379,8 @@ class AIQQBot(botpy.Client):
                 session_id = session["id"]
             else:
                 session_id = await self.agent.create_session(user_openid)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"qq_bot.c2c_session_failed: {e}")
 
         msg_id = getattr(message, 'id', '') or getattr(message, 'message_id', '')
         if msg_id and self._is_duplicate_msg(msg_id):
@@ -325,47 +402,13 @@ class AIQQBot(botpy.Client):
             logger.error(f"qq_bot.c2c_error: {e}")
             try:
                 await message.reply(content="嗯……出了点小问题，等会儿再聊好不好？", msg_seq=_next_msg_seq())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"qq_bot.c2c_fallback_reply_failed: {e}")
 
     async def on_group_at_message_create(self, message: GroupMessage):
         content = message.content.strip()
 
-        attachment_info = ""
-        image_data = []
-        if hasattr(message, 'attachments') and message.attachments:
-            parts = []
-            for att in message.attachments:
-                ct = getattr(att, 'content_type', '') or ''
-                fn = getattr(att, 'filename', '') or ''
-                result = await self.agent.receive_file(att)
-                if result["status"] == "ok":
-                    if result.get("text_preview"):
-                        parts.append(f"[文件: {fn}]\n内容预览:\n{result['text_preview'][:500]}")
-                    else:
-                        if ct.startswith("image/"):
-                            save_path = result.get('save_path', '')
-                            parts.append(f"[图片: {fn}，已保存到 {save_path}]")
-                            try:
-                                import base64 as b64mod
-                                p = Path(save_path)
-                                if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
-                                    mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
-                                    mime = mime_map.get(p.suffix.lower(), "image/jpeg")
-                                    img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
-                                    image_data.append({"mimeType": mime, "data": img_b64})
-                            except Exception as e:
-                                logger.warning("qq_bot.image_encode_failed", error=str(e))
-                        else:
-                            parts.append(f"[文件: {fn}，已保存到 {result['save_path']}]")
-                else:
-                    if ct.startswith("image/"):
-                        parts.append(f"[图片: {fn or 'image'}]")
-                    elif ct.startswith("video/"):
-                        parts.append(f"[视频: {fn or 'video'}]")
-                    else:
-                        parts.append(f"[附件: {fn or 'unknown'}]")
-            attachment_info = " ".join(str(p) for p in parts)
+        image_data, attachment_info = await self._process_message_attachments(message)
 
         if not content and not attachment_info:
             return
@@ -399,8 +442,8 @@ class AIQQBot(botpy.Client):
             logger.error(f"qq_bot.group_error: {e}")
             try:
                 await message.reply(content="嗯……出了点小问题，等会儿再聊好不好？", msg_seq=_next_msg_seq())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"qq_bot.group_fallback_reply_failed: {e}")
 
     async def _send_reply_with_media(self, message, reply: str,
                                       image_path: Path | None = None,
@@ -447,42 +490,162 @@ class AIQQBot(botpy.Client):
     async def _upload_c2c_base64(self, openid: str, image_path: Path, file_type: int = 1) -> str:
         from botpy.http import Route
 
-        def _read():
-            with open(image_path, "rb") as f:
-                return base64.b64encode(f.read()).decode()
+        compressed_path: Path | None = None
+        try:
+            def _read():
+                nonlocal compressed_path
+                # 图片类型且文件过大时压缩
+                path_to_upload = image_path
+                if file_type == 1 and image_path.stat().st_size > 800_000:
+                    compressed_path = self._compress_image(image_path)
+                    path_to_upload = compressed_path
+                with open(path_to_upload, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
 
-        file_data = await asyncio.to_thread(_read)
-        payload = {
-            "openid": openid,
-            "file_type": file_type,
-            "file_data": file_data,
-            "srv_send_msg": False,
-        }
-        route = Route("POST", "/v2/users/{openid}/files", openid=openid)
-        result = await self.api._http.request(route, json=payload)
-        if isinstance(result, dict):
-            return result.get("file_info", "")
-        return result.file_info
+            file_data = await asyncio.to_thread(_read)
+            payload = {
+                "openid": openid,
+                "file_type": file_type,
+                "file_data": file_data,
+                "srv_send_msg": False,
+            }
+            route = Route("POST", "/v2/users/{openid}/files", openid=openid)
+            # 重试最多3次，每次间隔递增
+            last_err = None
+            for attempt in range(3):
+                try:
+                    result = await self.api._http.request(route, json=payload)
+                    if isinstance(result, dict):
+                        file_info = result.get("file_info", "")
+                    else:
+                        file_info = result.file_info
+                    if not file_info:
+                        raise RuntimeError(f"C2C文件上传返回空file_info (openid={openid})")
+                    return file_info
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        wait = (attempt + 1) * 3
+                        logger.warning("qq_bot.upload_retry", attempt=attempt + 1, wait=wait, error=str(e))
+                        await asyncio.sleep(wait)
+            raise last_err
+        finally:
+            if compressed_path is not None:
+                try:
+                    compressed_path.unlink()
+                    logger.info("qq_bot.temp_file_cleaned", path=str(compressed_path))
+                except Exception as e:
+                    logger.warning(f"qq_bot.temp_file_cleanup_failed: {e}")
 
     async def _upload_group_base64(self, group_openid: str, image_path: Path, file_type: int = 1) -> str:
         from botpy.http import Route
 
-        def _read():
-            with open(image_path, "rb") as f:
-                return base64.b64encode(f.read()).decode()
+        compressed_path: Path | None = None
+        try:
+            def _read():
+                nonlocal compressed_path
+                # 图片类型且文件过大时压缩
+                path_to_upload = image_path
+                if file_type == 1 and image_path.stat().st_size > 800_000:
+                    compressed_path = self._compress_image(image_path)
+                    path_to_upload = compressed_path
+                with open(path_to_upload, "rb") as f:
+                    return base64.b64encode(f.read()).decode()
 
-        file_data = await asyncio.to_thread(_read)
-        payload = {
-            "group_openid": group_openid,
-            "file_type": file_type,
-            "file_data": file_data,
-            "srv_send_msg": False,
-        }
-        route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=group_openid)
-        result = await self.api._http.request(route, json=payload)
-        if isinstance(result, dict):
-            return result.get("file_info", "")
-        return result.file_info
+            file_data = await asyncio.to_thread(_read)
+            payload = {
+                "group_openid": group_openid,
+                "file_type": file_type,
+                "file_data": file_data,
+                "srv_send_msg": False,
+            }
+            route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=group_openid)
+            # 重试最多3次，每次间隔递增
+            last_err = None
+            for attempt in range(3):
+                try:
+                    result = await self.api._http.request(route, json=payload)
+                    if isinstance(result, dict):
+                        file_info = result.get("file_info", "")
+                    else:
+                        file_info = result.file_info
+                    if not file_info:
+                        raise RuntimeError(f"群文件上传返回空file_info (group_openid={group_openid})")
+                    return file_info
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        wait = (attempt + 1) * 3
+                        logger.warning("qq_bot.upload_retry", attempt=attempt + 1, wait=wait, error=str(e))
+                        await asyncio.sleep(wait)
+            raise last_err
+        finally:
+            if compressed_path is not None:
+                try:
+                    compressed_path.unlink()
+                    logger.info("qq_bot.temp_file_cleaned", path=str(compressed_path))
+                except Exception as e:
+                    logger.warning(f"qq_bot.temp_file_cleanup_failed: {e}")
+
+    @staticmethod
+    def _compress_image(image_path: Path, max_size: int = 800_000, quality: int = 75) -> Path:
+        """压缩图片到指定大小以下，返回压缩后的临时文件路径。
+
+        所有中间临时文件会在方法内部清理，只保留最终成功的文件。
+        调用者负责在不再需要时删除返回的临时文件。
+        """
+        from PIL import Image
+        import tempfile
+
+        tmp_path: Path | None = None
+
+        with Image.open(image_path) as img:
+            # 如果是 RGBA/P 模式，转为 RGB
+            if img.mode in ("RGBA", "P"):
+                img = img.convert("RGB")
+
+            # 逐步降低质量直到满足大小要求
+            for q in range(quality, 20, -10):
+                prev_tmp = tmp_path
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+                    tmp_path = Path(f.name)
+                img.save(tmp_path, "JPEG", quality=q)
+                # 清理上一次的临时文件
+                if prev_tmp is not None:
+                    try:
+                        prev_tmp.unlink()
+                    except Exception as e:
+                        logger.warning(f"qq_bot.compress_temp_cleanup_failed: {e}")
+                if tmp_path.stat().st_size <= max_size:
+                    logger.info("qq_bot.image_compressed", original=str(image_path),
+                                original_size=image_path.stat().st_size,
+                                compressed_size=tmp_path.stat().st_size, quality=q)
+                    return tmp_path
+
+            # 如果质量降到 20 还是太大，缩小尺寸
+            scale = 0.75
+            while scale >= 0.25:
+                new_w = int(img.width * scale)
+                new_h = int(img.height * scale)
+                resized = img.resize((new_w, new_h), Image.LANCZOS)
+                prev_tmp = tmp_path
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+                    tmp_path = Path(f.name)
+                resized.save(tmp_path, "JPEG", quality=60)
+                # 清理上一次的临时文件
+                if prev_tmp is not None:
+                    try:
+                        prev_tmp.unlink()
+                    except Exception as e:
+                        logger.warning(f"qq_bot.resize_temp_cleanup_failed: {e}")
+                if tmp_path.stat().st_size <= max_size:
+                    logger.info("qq_bot.image_resized", original=f"{img.width}x{img.height}",
+                                resized=f"{new_w}x{new_h}", size=tmp_path.stat().st_size)
+                    return tmp_path
+                scale -= 0.1
+
+        # 最终兜底：返回最小版本
+        return tmp_path
 
     async def _send_reply_with_sticker(self, message, result: ProcessResult):
         from text_utils import smart_truncate, split_long_reply
@@ -495,13 +658,20 @@ class AIQQBot(botpy.Client):
         if len(parts) == 1:
             final_text = parts[0]
         else:
+            failed = False
             for part in parts[:-1]:
                 try:
                     await message.reply(content=part, msg_seq=_next_msg_seq())
-                except Exception:
-                    pass
-            final_text = parts[-1]
+                except Exception as e:
+                    logger.warning(f"qq_bot.long_reply_part_failed: {e}")
+                    failed = True
+                    break
+            if failed:
+                final_text = parts[-1] + "\n（内容过长部分发送失败）"
+            else:
+                final_text = parts[-1]
 
+        # 1. 文字+表情包立刻发送（用户最快看到回复）
         if result.sticker_path:
             try:
                 await self._send_reply_with_media(message, final_text, image_path=result.sticker_path)
@@ -511,17 +681,84 @@ class AIQQBot(botpy.Client):
         else:
             await message.reply(content=final_text, msg_seq=_next_msg_seq())
 
+        # 2. 语音和图片并行发送
+        send_tasks = []
+
+        # TTS 语音发送
         if result.audio_path and result.audio_path.exists():
+            async def _send_cached_audio():
+                try:
+                    await self._send_audio(message, result.audio_path)
+                except Exception as e:
+                    logger.warning("qq_bot.audio_send_failed", error=str(e))
+            send_tasks.append(_send_cached_audio())
+
+        # 视频发送
+        if result.video_path and result.video_path.exists():
+            async def _send_vid():
+                try:
+                    await self._send_video(message, result.video_path)
+                except Exception as e:
+                    logger.warning("qq_bot.video_send_failed", error=str(e))
+            send_tasks.append(_send_vid())
+
+        # 图片发送
+        if result.image_paths:
+            async def _send_images():
+                for img_path in result.image_paths:
+                    try:
+                        await self._send_reply_with_media(message, "", image_path=img_path)
+                    except Exception as e:
+                        logger.error("qq_bot.image_send_error", error=str(e), path=str(img_path))
+                        try:
+                            await message.reply(content="图片生成成功，但发送失败", msg_seq=_next_msg_seq())
+                        except Exception as e2:
+                            logger.error(f"qq_bot.image_fallback_reply_failed: {e2}")
+            send_tasks.append(_send_images())
+
+        # 并行等待所有媒体发送完成
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
+
+    async def _send_video(self, message, video_path: Path):
+        """发送视频消息"""
+        try:
+            if isinstance(message, C2CMessage):
+                file_info = await self._upload_c2c_base64(message.author.user_openid, video_path, file_type=2)
+                await self.api.post_c2c_message(
+                    openid=message.author.user_openid,
+                    msg_type=7,
+                    content="",
+                    media={"file_info": file_info},
+                    msg_seq=_next_msg_seq(),
+                    msg_id=message.id
+                )
+            elif isinstance(message, GroupMessage):
+                file_info = await self._upload_group_base64(message.group_openid, video_path, file_type=2)
+                await self.api.post_group_message(
+                    group_openid=message.group_openid,
+                    msg_type=7,
+                    content="",
+                    media={"file_info": file_info},
+                    msg_seq=_next_msg_seq(),
+                    msg_id=message.id
+                )
+            logger.info("qq_bot.video_sent", video_path=str(video_path))
+        except Exception as e:
+            logger.error("qq_bot.video_send_error", error=str(e), video_path=str(video_path))
+            # 降级为文本消息
             try:
-                await self._send_audio(message, result.audio_path)
+                await message.reply(content=f"视频生成成功，但发送失败: {e}", msg_seq=_next_msg_seq())
             except Exception as e:
-                logger.warning("qq_bot.audio_send_failed", error=str(e))
+                logger.error(f"qq_bot.video_fallback_reply_failed: {e}")
 
     async def _send_audio(self, message, audio_path: Path):
+        silk_path = None
         try:
             silk_path = await self._convert_to_silk(audio_path)
             if silk_path is None:
                 logger.warning("qq_bot.silk_convert_failed", path=str(audio_path))
+                await message.reply(content="语音消息发送失败：缺少 SILK 编码库，请联系管理员安装 pilk", msg_seq=_next_msg_seq())
                 return
 
             if isinstance(message, C2CMessage):
@@ -542,8 +779,19 @@ class AIQQBot(botpy.Client):
                 )
         except Exception as e:
             logger.warning("qq_bot.audio_send_error", error=str(e))
+        finally:
+            # 只清理中间文件（silk），不删除输入文件（audio_path）
+            if silk_path is not None:
+                try:
+                    p = Path(silk_path)
+                    if p.exists():
+                        p.unlink()
+                        logger.info("qq_bot.temp_file_cleaned", path=str(p))
+                except Exception as e:
+                    logger.warning(f"qq_bot.audio_temp_cleanup_failed: {e}")
 
     async def _convert_to_silk(self, audio_path: Path) -> Path | None:
+        pcm_path = None
         try:
             import pilk
             import subprocess
@@ -564,14 +812,21 @@ class AIQQBot(botpy.Client):
 
             ok = await asyncio.to_thread(_do_convert)
 
+            # 无论成功失败，都清理 pcm 中间文件
+            try:
+                pcm_path.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"qq_bot.pcm_cleanup_failed: {e}")
+
             if ok and silk_path.exists() and silk_path.stat().st_size > 0:
                 logger.info("qq_bot.silk_convert_ok", input=str(audio_path), output=str(silk_path),
                             size_kb=silk_path.stat().st_size // 1024)
-                try:
-                    pcm_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 return silk_path
+            # 转换失败时清理可能残留的 silk 文件
+            try:
+                silk_path.unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"qq_bot.silk_cleanup_failed: {e}")
             return None
         except ImportError:
             logger.warning("qq_bot.pilk_not_installed")
@@ -612,7 +867,7 @@ if __name__ == "__main__":
 
     while retry_count < MAX_RETRIES:
         try:
-            client = AIQQBot(intents=intents, is_sandbox=is_sandbox)
+            client = AIQQBot(intents=intents, is_sandbox=is_sandbox, timeout=30)
             client.run(appid=APP_ID, secret=APP_SECRET)
             retry_count = 0
             logger.warning("qq_bot.exited_normally_restarting")

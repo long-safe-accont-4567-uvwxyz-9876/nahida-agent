@@ -1,3 +1,4 @@
+import asyncio
 import time
 from typing import Callable
 from loguru import logger
@@ -15,13 +16,16 @@ class AgentContext:
     SYSTEM_PROMPT_TOKENS_BUDGET = 2000
     DYNAMIC_CACHE_TTL = 600
     PORTRAIT_CACHE_TTL = 1800
-    COMPRESS_RATIO = 0.6
+    COMPRESS_TARGET_RATIO = 0.6   # 压缩目标：60% 的 MAX_HISTORY_TOKENS
+    MAX_COMPRESS_ROUNDS = 5        # 最大压缩轮数
+    MAX_COMPRESSED_SUMMARY_LEN = 3000
 
     def __init__(self, system_prompt: str = "", system_prompt_loader: Callable[[], str] | None = None,
-                 router=None):
+                 router=None, security_filter=None):
         self.system_prompt = system_prompt
         self._system_prompt_loader = system_prompt_loader
         self._router = router
+        self._security_filter = security_filter
         self.history: list[dict] = []
         self.memory_retrieval: list[dict] | None = None
         self.emotion_hint: str = ""
@@ -30,6 +34,8 @@ class AgentContext:
         self.pending_tasks: list[str] | None = None
         self.klee_context: str | None = None
         self.learned_rules: str | None = None
+        # 三层提示架构
+        self.instinct_prompt: str = ""  # Instinct 提示（stable 层）
         self._last_message_time: float = 0.0
         self._cached_dynamic_prompt: str = ""
         self._dynamic_cache_ts: float = 0.0
@@ -40,47 +46,96 @@ class AgentContext:
         self._restored_summary: str = ""
         self._compressed_summary: str = ""
         self._compress_count: int = 0
+        # 上下文压缩器
+        self._compressor = None
+        # 并发安全锁
+        self._lock = asyncio.Lock()
 
-    def add_message(self, role: str, content: str, **kwargs):
+    async def add_message(self, role: str, content: str, **kwargs):
         msg = {"role": role, "content": str(content) if content is not None else ""}
         if kwargs.get("reasoning_content"):
             msg["reasoning_content"] = kwargs["reasoning_content"]
         if kwargs.get("tool_calls"):
             msg["tool_calls"] = kwargs["tool_calls"]
-        self.history.append(msg)
-        self._last_message_time = time.time()
-        self._trim_history()
+        async with self._lock:
+            self.history.append(msg)
+            self._last_message_time = time.time()
+            await self._trim_history()
 
-    def _trim_history(self):
+    async def _trim_history(self):
+        if len(self._compressed_summary) > self.MAX_COMPRESSED_SUMMARY_LEN:
+            self._compressed_summary = self._compressed_summary[-self.MAX_COMPRESSED_SUMMARY_LEN:]
+
         if not self.history or self._history_tokens() <= self.MAX_HISTORY_TOKENS:
             return
 
-        preserve_count = min(10, len(self.history))
-        compressible = self.history[:len(self.history) - preserve_count]
+        target_tokens = int(self.MAX_HISTORY_TOKENS * self.COMPRESS_TARGET_RATIO)
 
-        if not compressible:
-            while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
+        # 尝试使用 ContextCompressor 进行更好的压缩
+        if self._compressor is None and self._router:
+            try:
+                from context_compressor import get_context_compressor
+                self._compressor = get_context_compressor(router=self._router)
+            except Exception:
+                self._compressor = None
+
+        # Token 目标驱动的迭代压缩，最多 MAX_COMPRESS_ROUNDS 轮
+        for _round in range(self.MAX_COMPRESS_ROUNDS):
+            if self._history_tokens() <= target_tokens:
+                return
+
+            preserve_count = min(10, len(self.history))
+            compressible = self.history[:len(self.history) - preserve_count]
+
+            if not compressible:
+                break
+
+            if self._compressor:
+                try:
+                    result = self._compressor.compress_history(self.history, keep_recent=preserve_count // 2)
+                    compressed_msgs = result.messages
+                    if len(compressed_msgs) < len(self.history):
+                        # 提取压缩后的摘要
+                        for msg in compressed_msgs:
+                            if msg.get("role") == "system" and "上下文压缩" in msg.get("content", ""):
+                                self._compressed_summary = (
+                                    f"{self._compressed_summary}\n{msg['content']}" if self._compressed_summary else msg["content"]
+                                )
+                                break
+                        self.history = [m for m in compressed_msgs if m.get("role") != "system" or "上下文压缩" not in m.get("content", "")]
+                        if len(self._compressed_summary) > self.MAX_COMPRESSED_SUMMARY_LEN:
+                            self._compressed_summary = self._compressed_summary[-self.MAX_COMPRESSED_SUMMARY_LEN:]
+                        self._compress_count += 1
+                        logger.info("context.compressed_with_ccr", round=_round + 1, tokens=self._history_tokens(), target=target_tokens)
+                        continue
+                except Exception as e:
+                    logger.debug("context.ccr_compress_failed", error=str(e))
+
+            # 回退到原有压缩逻辑
+            compress_count = max(1, int(len(compressible) * self.COMPRESS_TARGET_RATIO))
+            to_compress = compressible[:compress_count]
+            remaining_compressible = compressible[compress_count:]
+            preserved = self.history[len(self.history) - preserve_count:]
+
+            summary = self._summarize_messages(to_compress)
+            if summary:
+                self._compressed_summary = (
+                    f"{self._compressed_summary}\n{summary}" if self._compressed_summary else summary
+                )
+                if len(self._compressed_summary) > self.MAX_COMPRESSED_SUMMARY_LEN:
+                    self._compressed_summary = self._compressed_summary[-self.MAX_COMPRESSED_SUMMARY_LEN:]
+                self._compress_count += 1
+                self.history = remaining_compressible + preserved
+                logger.info("context.compressed", round=_round + 1, compressed=compress_count, tokens=self._history_tokens(), target=target_tokens)
+            else:
+                # 摘要失败，强制移除最旧的消息
                 removed = self.history.pop(0)
                 logger.debug("context.trimmed", role=removed["role"], preview=removed["content"][:40])
-            return
 
-        compress_count = max(1, int(len(compressible) * self.COMPRESS_RATIO))
-        to_compress = compressible[:compress_count]
-        remaining_compressible = compressible[compress_count:]
-        preserved = self.history[len(self.history) - preserve_count:]
-
-        summary = self._summarize_messages(to_compress)
-        if summary:
-            self._compressed_summary = (
-                f"{self._compressed_summary}\n{summary}" if self._compressed_summary else summary
-            )
-            self._compress_count += 1
-            self.history = remaining_compressible + preserved
-            logger.info("context.compressed", compressed=compress_count, summary_len=len(summary))
-        else:
-            while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
-                removed = self.history.pop(0)
-                logger.debug("context.trimmed", role=removed["role"], preview=removed["content"][:40])
+        # 最终强制裁剪：如果 5 轮后仍超限，强制移除最旧的消息
+        while self.history and self._history_tokens() > self.MAX_HISTORY_TOKENS:
+            removed = self.history.pop(0)
+            logger.debug("context.force_trimmed", role=removed["role"], preview=removed["content"][:40])
 
     def _summarize_messages(self, messages: list[dict]) -> str:
         if not messages or not self._router:
@@ -104,24 +159,32 @@ class AgentContext:
 
         try:
             import asyncio
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+            try:
+                asyncio.get_running_loop()
+                # 在运行中的事件循环内，不能调用 run_until_complete
                 return self._quick_summarize(messages)
+            except RuntimeError:
+                # 没有运行中的事件循环，可以安全使用
+                pass
 
-            result = loop.run_until_complete(
-                self._router.route(
-                    "chat_flash",
-                    [
-                        {"role": "system", "content": "请将以下对话记录压缩为1-2句话的摘要，保留关键信息和上下文。只输出摘要，不要加任何前缀。"},
-                        {"role": "user", "content": text},
-                    ],
-                    temperature=0.3,
-                    max_tokens=200,
+            loop = asyncio.new_event_loop()
+            try:
+                result = loop.run_until_complete(
+                    self._router.route(
+                        "chat_flash",
+                        [
+                            {"role": "system", "content": "请将以下对话记录压缩为1-2句话的摘要，保留关键信息和上下文。只输出摘要，不要加任何前缀。"},
+                            {"role": "user", "content": text},
+                        ],
+                        temperature=0.3,
+                        max_tokens=200,
+                    )
                 )
-            )
-            if isinstance(result, str) and result.strip():
-                return result.strip()
-            return self._quick_summarize(messages)
+                if isinstance(result, str) and result.strip():
+                    return result.strip()
+                return self._quick_summarize(messages)
+            finally:
+                loop.close()
         except Exception as e:
             logger.debug("context.summarize_failed", error=str(e))
             return self._quick_summarize(messages)
@@ -131,7 +194,11 @@ class AgentContext:
         for m in messages:
             role = m.get("role", "")
             content = m.get("content", "")
-            if not content or role == "tool":
+            if not content:
+                continue
+            if role == "tool":
+                tool_name = m.get("name", "工具")
+                lines.append(f"[{tool_name}]: {content[:60]}")
                 continue
             prefix = {"user": "用户", "assistant": "纳西妲"}.get(role, role)
             lines.append(f"{prefix}: {content[:80]}")
@@ -153,10 +220,10 @@ class AgentContext:
         parts = []
 
         if self._compressed_summary:
-            parts.append(f"[已压缩的早期对话摘要（仅供参考，不需要回应）]\n{self._compressed_summary}")
+            parts.append(f"[已压缩的早期对话摘要（仅供参考，不需要回应。根据当前用户意图独立判断是否需要调用工具）]\n{self._compressed_summary}")
 
         if self._restored_summary:
-            parts.append(f"[近期对话摘要（仅供参考，不需要回应）]\n{self._restored_summary}")
+            parts.append(f"[近期对话摘要（仅供参考，不需要回应。根据当前用户意图独立判断是否需要调用工具）]\n{self._restored_summary}")
 
         portrait = self.user_portrait or ""
         if portrait:
@@ -191,28 +258,32 @@ class AgentContext:
         self._learned_cache_ts = 0.0
 
     def build_messages(self, user_input: str) -> list[dict]:
-        system_content = self._system_prompt_loader() if self._system_prompt_loader else self.system_prompt
+        # === Stable 层（跨会话缓存，极少变化）===
+        stable_parts = []
+        base_prompt = self._system_prompt_loader() if self._system_prompt_loader else self.system_prompt
 
+        if base_prompt:
+            stable_parts.append(base_prompt)
+        if self.instinct_prompt:
+            stable_parts.append(self.instinct_prompt)
+        stable_content = "\n\n---\n\n".join(stable_parts) if stable_parts else ""
+
+        # === Context 层（按项目/用户缓存，偶尔变化）===
+        context_parts = []
         dynamic = self._build_dynamic_prompt()
         if dynamic:
-            system_content += "\n\n---\n\n" + dynamic
+            context_parts.append(dynamic)
+        context_content = context_parts[0] if context_parts else ""
 
-        messages = [{"role": "system", "content": system_content}]
-
-        for msg in self.history:
-            m = {"role": msg["role"], "content": str(msg.get("content", "")) if msg.get("content") is not None else ""}
-            if msg.get("tool_calls"):
-                m["tool_calls"] = msg["tool_calls"]
-            if msg.get("reasoning_content"):
-                m["reasoning_content"] = msg["reasoning_content"]
-            messages.append(m)
-
-        user_block = user_input
-        parts = []
-
+        # === Volatile 层（每次重建，频繁变化）===
+        volatile_parts = []
+        from datetime import datetime
+        _now = datetime.now()
+        _weekday_map = {0: "日", 1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六"}
+        _time_str = f"{_now.strftime('%Y年%m月%d日')} 星期{_weekday_map[_now.weekday()]} {_now.strftime('%H:%M:%S')}"
+        volatile_parts.append(f"[当前时间] {_time_str}")
         if self.emotion_hint:
-            parts.append(f"[感知到爸爸的情绪：{self.emotion_hint}]")
-
+            volatile_parts.append(f"[感知到爸爸的情绪：{self.emotion_hint}]")
         if self.memory_retrieval:
             mem_texts = []
             for m in self.memory_retrieval[:3]:
@@ -223,22 +294,34 @@ class AgentContext:
                 if kg_ctx:
                     mem_texts.append(kg_ctx[:200])
             if mem_texts:
-                parts.append("[相关记忆]\n" + "\n".join(mem_texts))
-
+                volatile_parts.append("[相关记忆]\n" + "\n".join(mem_texts))
         if self.notebook_focus:
-            parts.append(f"[当前关注点] {self.notebook_focus}")
-
+            volatile_parts.append(f"[当前关注点] {self.notebook_focus}")
         if self.pending_tasks:
             task_lines = "\n".join(self.pending_tasks[:5])
-            parts.append(f"[待办提醒]\n{task_lines}")
-
+            volatile_parts.append(f"[待办提醒]\n{task_lines}")
         if self.klee_context:
-            parts.append(f"[可莉的回应（仅供参考，用自己的话转述，不要直接复制）]\n{self.klee_context}")
+            volatile_parts.append(f"[可莉的回应（仅供参考，用自己的话转述，不要直接复制）]\n{self.klee_context}")
+        volatile_content = "\n".join(volatile_parts) if volatile_parts else ""
 
-        if parts:
-            user_block = "\n".join(parts) + "\n---\n" + user_input
+        # 拼接三层
+        system_content = stable_content
+        if context_content:
+            system_content += "\n\n---\n\n" + context_content
+        if volatile_content:
+            system_content += "\n\n---\n\n" + volatile_content
 
-        messages.append({"role": "user", "content": user_block})
+        messages = [{"role": "system", "content": system_content}]
+
+        for msg in self.history:
+            m = {"role": msg["role"], "content": str(msg.get("content", "")) if msg.get("content") is not None else ""}
+            if msg.get("tool_calls"):
+                m["tool_calls"] = msg["tool_calls"]
+            # 注意：reasoning_content 不发送到 API（OpenAI API 不支持此字段）
+            # 它仅保存在 history 中供内部使用
+            messages.append(m)
+
+        messages.append({"role": "user", "content": user_input})
         return messages
 
     async def restore_from_db(self, db):
@@ -265,6 +348,25 @@ class AgentContext:
         except Exception as e:
             logger.warning("context.restore_failed", error=str(e))
 
+    def get_nahida_prompt(self) -> str:
+        """获取纳西妲的系统提示词。
+
+        依次尝试从 system_prompt 属性、_system_prompt_loader 回调获取，
+        均失败时返回默认提示词。用于子 Agent 汇总、工具结果摘要等场景。
+
+        Returns:
+            str: 纳西妲的系统提示词文本
+        """
+        nahida_prompt = getattr(self, "system_prompt", "") or ""
+        if not nahida_prompt and hasattr(self, "_system_prompt_loader") and self._system_prompt_loader:
+            try:
+                nahida_prompt = self._system_prompt_loader()
+            except Exception as e:
+                logger.warning(f"加载纳西妲系统提示词失败: {e}")
+        if not nahida_prompt:
+            nahida_prompt = "你是纳西妲，须弥的草神。"
+        return nahida_prompt
+
     def clear(self):
         self.history.clear()
         self.memory_retrieval = None
@@ -272,5 +374,6 @@ class AgentContext:
         self.user_portrait = None
         self.notebook_focus = None
         self.pending_tasks = None
+        self.instinct_prompt = ""
         self._compressed_summary = ""
         self._compress_count = 0

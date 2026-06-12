@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,33 +19,35 @@ from loguru import logger
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import MIMO_API_KEY, MIMO_BASE_URL, MIMO_MODEL, AGENT_CONFIG, WORKSPACE_DIR, STICKER_DIR, KLEE_STICKER_DIR, FILE_DIR, build_system_prompt
+from config import MIMO_MODEL, AGENT_CONFIG, WORKSPACE_DIR, STICKER_DIR, KLEE_STICKER_DIR, FILE_DIR, build_system_prompt, SIMPLE_TASK_KEYWORDS, PRO_TASK_KEYWORDS
 from model_router import ModelRouter
 from agent_context import AgentContext
 from database import DatabaseManager
 from security import SecurityFilter
-from tool_registry import to_openai_tools, get_tool, clear_tools
+from tool_registry import to_openai_tools
 from tool_executor import ToolExecutor
 from tool_repair import ToolCallRepair
 from memory_manager import MemoryManager
-from vector_store import VectorStore
 from emotion_simple import detect_emotion, build_emotion_hint
+from emotion_enum import CN_TO_EN, is_unified, ensure_emotion_tag
 from result_wrapper import ResultWrapper
-from text_utils import smart_truncate, strip_dsml, has_dsml_tool_calls, parse_dsml_tool_calls, humanize
+from text_utils import strip_dsml, has_dsml_tool_calls, parse_dsml_tool_calls, humanize, encode_image_to_base64
 from portrait_manager import PortraitManager
 from notebook_manager import NotebookManager
 from learning_manager import LearningManager
 from slash_commands import SlashCommandHandler
-from smart_error_handler import get_error_handler
-from knowledge_graph import KnowledgeGraph
 from sticker_manager import StickerManager
 from file_receiver import FileReceiver
 from tool_call_handler import ToolCallHandler
 from klee_agent import KleeAgent
 from tts_engine import TTSEngine
-from agent_dispatcher import AgentDispatcher, SubAgentConfig
-from task_orchestrator import TaskGraph, build_task_graph, run_task_graph
-from emoji_config import get_status_msg
+from agent_dispatcher import AgentDispatcher
+from mcp_client import MCPManager
+from task_orchestrator import TaskGraph, run_task_graph
+from instinct_manager import InstinctManager
+from credential_pool import get_credential_pool
+from error_classifier import ErrorClassifier
+from hooks import get_hook_engine, HookEngine
 
 import tools.file_tools_v2
 import tools.code_tools_v2
@@ -55,6 +58,7 @@ import tools.multi_search_tools
 import tools.hardware_tools
 import tools.vision_tools
 import tools.system_tools
+import tools.agnes_tools
 
 
 def _extract_reasoning_content(response: Any) -> str | None:
@@ -82,13 +86,13 @@ def _extract_delta_reasoning_content(chunk_dict: dict) -> str | None:
 
 DEGRADED_REPLY = "嗯……人家现在有点不太舒服，等会儿再聊好不好？"
 
-_bg_tasks: set[asyncio.Task] = set()
+from core.background_tasks import BackgroundTaskManager, _spawn, _bg_tasks
+from core.bootstrap import AgentCoreBootstrapper
+from core.router_engine import RouterEngine, RoutingDecision
+from core.chat_processor import ChatProcessor
+from core.tool_orchestrator import ToolOrchestrator
 
-
-def _spawn(coro):
-    task = asyncio.create_task(coro)
-    _bg_tasks.add(task)
-    task.add_done_callback(_bg_tasks.discard)
+_current_request_ctx: ContextVar["RequestContext | None"] = ContextVar("_current_request_ctx", default=None)
 
 
 @dataclass
@@ -98,6 +102,21 @@ class ProcessResult:
     sticker_path: Path | None = None
     audio_path: Path | None = None
     tool_results: list = field(default_factory=list)
+    image_paths: list[Path] = field(default_factory=list)
+    video_path: Path | None = None
+
+
+@dataclass
+class RequestContext:
+    """请求级临时状态，每次 process() 调用创建一个新实例，避免并发请求时状态互相污染。"""
+    session_id: str = ""
+    user_openid: str = ""
+    user_id: str = ""
+    user_input: str = ""
+    status_callback: Any = None
+    handled_by_tool_call: bool = False
+    last_user_emotion: str = ""
+    delegate_depth: int = 0
 
 
 class AgentCore:
@@ -107,7 +126,7 @@ class AgentCore:
         _owner_ids = os.getenv("OWNER_IDS", "").split(",")
         _owner_ids = [x.strip() for x in _owner_ids if x.strip()]
         self.security = SecurityFilter(owner_ids=_owner_ids)
-        self.context = AgentContext(system_prompt_loader=build_system_prompt, router=self.router)
+        self.context = AgentContext(system_prompt_loader=build_system_prompt, router=self.router, security_filter=self.security)
         self.tool_executor = ToolExecutor(db=self.db)
         self.tool_repair = ToolCallRepair(
             allowed_tool_names=set(t["function"]["name"] for t in to_openai_tools())
@@ -119,11 +138,6 @@ class AgentCore:
         self.learning_manager: LearningManager | None = None
         self.slash_handler: SlashCommandHandler | None = None
         self._initialized = False
-        self._current_session_id: str = ""
-        self._current_user_openid: str = ""
-        self._current_user_input: str = ""
-        self._handled_by_tool_call = False
-        self._last_user_emotion: str = ""
         self.sticker_manager = StickerManager(STICKER_DIR)
         self.klee_sticker_manager = StickerManager(KLEE_STICKER_DIR)
         self.file_receiver = FileReceiver(FILE_DIR)
@@ -134,154 +148,32 @@ class AgentCore:
             tool_executor=self.tool_executor,
             tool_repair=self.tool_repair,
             delegate_callback=self._nahida_delegate_for_klee,
+            core=self,
         )
         self._task_graph: TaskGraph | None = None
         self._agent_route_configs: dict = {}
-        self._tool_call_handler = ToolCallHandler(self.tool_executor, self.tool_repair, self._clean_reply, self.context, self.router, klee_delegate=self.delegate_to_klee, agent_name="nahida", personality_file=str(Path(__file__).parent / "nahida_personality.md"))
-        self._status_callback = None
+        self._tool_call_handler = ToolCallHandler(self.tool_executor, self.tool_repair, self._clean_reply, self.context, self.router, klee_delegate=self.delegate_to_klee, agent_name="nahida", personality_file=str(Path(__file__).parent / "nahida_personality.md"), tool_execute_callback=self._execute_tool_with_hooks)
         self._user_chat_target: dict[str, str] = {}
-        self._delegate_depth = 0
+        self._chat_target_lock = asyncio.Lock()
+        self._router_engine = RouterEngine(belief_router=None)  # belief_router 灰度期暂不接入
+        self._chat_processor = ChatProcessor(self)
+        self._tool_orchestrator = ToolOrchestrator(self)
         self._voice_mode: bool = False
         self._error_handler = None
+        self._mcp_manager = MCPManager()
+        self.instinct_manager: InstinctManager | None = None
+        self._credential_pool = get_credential_pool()
+        self._error_classifier = ErrorClassifier()
+        self._hook_engine = get_hook_engine()
+        self._bg_task_manager: BackgroundTaskManager | None = None
+
+    @property
+    def hook_engine(self):
+        return self._hook_engine
 
     async def init(self) -> None:
-        await self._init_infrastructure()
-        await self._init_cognitive()
-        await self.klee.init()
-        await self.tts.init()
-        keli_config = SubAgentConfig(
-            name="keli",
-            display_name="可莉",
-            provider="mimo",
-            model="mimo-v2.5-pro",
-            personality_file=str(Path(__file__).parent / "klee_personality.md"),
-            voice_ref="keli",
-            excluded_tools={"call_klee", "shell_command", "python_executor", "write_file", "search_files", "read_file", "list_files", "web_browse", "document_reader", "multi_search", "wolfram_query"},
-            base_url="https://api.xiaomimimo.com/v1",
-            api_key_env="MIMO_API_KEY",
-            capabilities=["chat", "play", "fun"],
-            route_description="日常聊天、玩耍、轻松有趣的对话",
-        )
-        await self.dispatcher.register(keli_config)
-        yinlang_config = SubAgentConfig(
-            name="yinlang",
-            display_name="银狼",
-            provider="mimo",
-            model="mimo-v2.5-pro",
-            personality_file=str(Path(__file__).parent / "yinlang_personality.md"),
-            voice_ref=None,
-            excluded_tools={"call_klee", "call_nahida"},
-            base_url="https://api.xiaomimimo.com/v1",
-            api_key_env="MIMO_API_KEY",
-            capabilities=["coding", "debug", "script", "programming", "hardware", "system", "devops"],
-            route_description="编程、代码编写、调试、技术问题、硬件控制、系统运维、开发辅助",
-        )
-        await self.dispatcher.register(yinlang_config)
-        xilian_config = SubAgentConfig(
-            name="xilian",
-            display_name="昔涟",
-            provider="mimo",
-            model="mimo-v2.5-pro",
-            personality_file=str(Path(__file__).parent / "xilian_personality.md"),
-            voice_ref=None,
-            excluded_tools={"call_klee", "call_nahida", "shell_command", "python_executor", "write_file"},
-            base_url="https://api.xiaomimimo.com/v1",
-            api_key_env="MIMO_API_KEY",
-            capabilities=["search", "lookup", "query", "explore", "discover"],
-            route_description="搜索信息、查询资料、探索发现",
-        )
-        await self.dispatcher.register(xilian_config)
-        nike_config = SubAgentConfig(
-            name="nike",
-            display_name="尼可",
-            provider="mimo",
-            model="mimo-v2.5-pro",
-            personality_file=str(Path(__file__).parent / "nike_personality.md"),
-            voice_ref=None,
-            excluded_tools={"call_klee", "call_nahida", "shell_command", "write_file"},
-            base_url="https://api.xiaomimimo.com/v1",
-            api_key_env="MIMO_API_KEY",
-            capabilities=["research", "analysis", "study", "academic"],
-            route_description="研究分析、学术思考、深度解读",
-        )
-        await self.dispatcher.register(nike_config)
-        from openai import AsyncOpenAI as _AOI
-        route_client = _AOI(
-            api_key=MIMO_API_KEY,
-            base_url=MIMO_BASE_URL,
-        )
-        for name, agent in self.dispatcher._agents.items():
-            self._agent_route_configs[name] = {
-                "display_name": agent.config.display_name,
-                "capabilities": agent.config.capabilities,
-                "route_description": agent.config.route_description,
-            }
-        self._task_graph = build_task_graph(
-            dispatcher=self.dispatcher,
-            agent_configs=self._agent_route_configs,
-            route_client=route_client,
-            nahida_chat_callback=self._nahida_synthesis_chat,
-        )
-        await self._init_interaction()
-        self._initialized = True
-        logger.info("agent_core.initialized")
-
-    async def _init_infrastructure(self) -> None:
-        await self.db.init()
-        self.router.set_db(self.db, analytics=self.db.analytics)
-        embed_api_key = os.getenv("EMBED_API_KEY", "")
-        embed_base_url = os.getenv("EMBED_BASE_URL", "https://api.siliconflow.cn/v1")
-        self._vec_store = None
-        if embed_api_key:
-            try:
-                self._vec_store = VectorStore(
-                    db_path=str(self.db.db_path).replace(".db", "_vec.db"),
-                    embed_api_key=embed_api_key,
-                    embed_base_url=embed_base_url,
-                )
-                await self._vec_store.init()
-                logger.info("vector_store.enabled")
-            except Exception as e:
-                logger.warning(f"vector_store.init_failed: {e}")
-                self._vec_store = None
-
-    async def _init_cognitive(self) -> None:
-        self.memory = MemoryManager(
-            db=self.db,
-            memory=self.db.memory,
-            vector_store=self._vec_store,
-            router=self.router,
-        )
-        self.knowledge_graph = KnowledgeGraph(db=self.db, knowledge_db=self.db.knowledge, router=self.router)
-        self.memory.set_knowledge_graph(self.knowledge_graph)
-        self.notebook_manager = NotebookManager(db=self.db, notebook=self.db.notebook, router=self.router)
-        self.learning_manager = LearningManager(db=self.db, learning=self.db.learning, router=self.router)
-        self.portrait_manager = PortraitManager(db=self.db, memory=self.db.memory, router=self.router, notebook=self.db.notebook)
-
-    async def _init_interaction(self) -> None:
-        self._error_handler = get_error_handler(
-            db=self.db,
-            dispatcher=self.dispatcher,
-        )
-        learning_additions = await self.learning_manager.get_system_prompt_additions()
-        if learning_additions:
-            self.context.learned_rules = learning_additions
-        portrait = await self.portrait_manager.get_current_portrait()
-        if portrait and portrait.get("content"):
-            self.context.user_portrait = portrait["content"]
-            logger.info("portrait.loaded", version=portrait.get("version"))
-        await self._load_notebook_context()
-        await self.context.restore_from_db(self.db)
-        self.slash_handler = SlashCommandHandler(
-            db=self.db,
-            router=self.router,
-            context=self.context,
-            memory=self.memory,
-            learning_manager=self.learning_manager,
-            notebook_manager=self.notebook_manager,
-            security=self.security,
-            agent=self,
-        )
+        bootstrapper = AgentCoreBootstrapper(self)
+        await bootstrapper.bootstrap()
 
     async def process(self, user_input: str, user_id: str = "qq_user",
                       source: str = "qq",
@@ -292,7 +184,22 @@ class AgentCore:
         if not self._initialized:
             return ProcessResult(reply=DEGRADED_REPLY)
 
-        self._status_callback = status_callback
+        ctx = RequestContext(
+            session_id=session_id,
+            user_openid=user_openid,
+            user_id=user_id,
+            user_input=user_input,
+            status_callback=status_callback,
+        )
+        _ctx_token = _current_request_ctx.set(ctx)
+        try:
+            return await self._process_impl(ctx, user_input, user_id, source, user_openid, session_id, status_callback, image_data)
+        finally:
+            _current_request_ctx.reset(_ctx_token)
+
+    async def _process_impl(self, ctx: RequestContext, user_input: str, user_id: str,
+                             source: str, user_openid: str, session_id: str,
+                             status_callback, image_data: list[dict] | None) -> ProcessResult:
         if self._tool_call_handler:
             self._tool_call_handler._tool_repair.clear_storm_window()
 
@@ -305,17 +212,12 @@ class AgentCore:
             trace.warning("agent.blocked", reason=reason)
             return ProcessResult(reply="")
 
-        content_ok, content_reason = self.security.check_content(user_input)
-        if not content_ok:
-            trace.warning("agent.content_blocked", reason=content_reason)
-            return ProcessResult(reply="嗯？你说的什么呀，我没有听懂～")
-
         if self.slash_handler and self.slash_handler.is_slash_command(user_input):
             slash_reply = await self.slash_handler.handle(user_input, user_id)
             return ProcessResult(reply=slash_reply)
 
-        chat_targets = self._parse_chat_target(user_input, user_id)
-        clean_input = re.sub(r'@[可莉纳西妲]+', '', user_input).strip()
+        chat_targets = await self._parse_chat_target(user_input, user_id)
+        clean_input = ChatProcessor.clean_mention_from_input(user_input)
 
         voice_intent = self._detect_voice_intent(clean_input)
         force_voice = voice_intent and not self._voice_mode
@@ -331,12 +233,12 @@ class AgentCore:
             if len(non_nahida_targets) == 1:
                 return await self._dispatch_single_sub_agent(
                     non_nahida_targets[0], clean_input, user_id, source, session_id, trace,
-                    force_voice=force_voice,
+                    force_voice=force_voice, ctx=ctx,
                 )
             else:
                 return await self._dispatch_parallel_sub_agents(
                     non_nahida_targets, clean_input, user_id, source, session_id, trace,
-                    force_voice=force_voice,
+                    force_voice=force_voice, ctx=ctx,
                 )
 
         if "nahida" in chat_targets and self._task_graph and not self._is_manual_target(user_input, user_id) and not self._is_simple_task(clean_input) and not force_voice and not image_data and not ("[图片:" in user_input and "已保存到" in user_input):
@@ -352,11 +254,14 @@ class AgentCore:
                 )
                 if graph_result.final_output:
                     emotion = detect_emotion(clean_input)
-                    self._last_user_emotion = emotion.get("primary", "")
-                    asyncio.create_task(self._background_tasks(
+                    ctx.last_user_emotion = emotion.get("primary", "")
+                    # 关键：写入对话历史，否则下一轮上下文丢失（"葡萄牙呢"类追问失忆 bug）
+                    await self.context.add_message("user", clean_input)
+                    await self.context.add_message("assistant", graph_result.final_output)
+                    self._bg_task_manager.run_background_tasks(
                         clean_input, graph_result.final_output, user_id, source, emotion, [],
                         session_id=session_id,
-                    ))
+                    )
                     emotion_label = emotion.get("primary", "")
                     clean_reply = self.klee_sticker_manager.strip_emotion_tag(graph_result.final_output)
                     sticker_path = None
@@ -366,7 +271,7 @@ class AgentCore:
                         try:
                             target_agent = self.dispatcher.get_agent(graph_result.route_target)
                             if target_agent:
-                                audio_path = await target_agent.synthesize(self._clean_reply(clean_reply))
+                                audio_path = await target_agent.synthesize(self._clean_reply(clean_reply), emotion=emotion_label)
                         except Exception as e:
                             logger.warning("agent.routed_tts_failed", error=str(e))
                     if audio_path:
@@ -385,7 +290,7 @@ class AgentCore:
         emotion = detect_emotion(user_input)
         emotion_hint = build_emotion_hint(emotion)
         self.context.emotion_hint = emotion_hint
-        self._last_user_emotion = emotion.get("primary", "")
+        ctx.last_user_emotion = emotion.get("primary", "")
 
         if self.memory:
             self.memory.signal_new_message()
@@ -398,7 +303,8 @@ class AgentCore:
 
         await self._load_notebook_context()
 
-        messages = self.context.build_messages(user_input)
+        effective_input = user_input
+        messages = self.context.build_messages(effective_input)
 
         if image_data:
             logger.info("agent.vision_start", image_count=len(image_data), total_b64_size=sum(len(img.get('data', '')) for img in image_data))
@@ -418,28 +324,23 @@ class AgentCore:
             if img_path_match:
                 img_path = img_path_match.group(1)
                 try:
-                    import base64 as b64mod
-                    p = Path(img_path)
-                    if p.exists() and p.is_file() and p.stat().st_size < 10 * 1024 * 1024:
-                        mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
-                        mime = mime_map.get(p.suffix.lower(), "image/jpeg")
-                        img_b64 = b64mod.b64encode(p.read_bytes()).decode("ascii")
-                        image_description = await self._describe_images([{"mimeType": mime, "data": img_b64}])
-                        if image_description:
-                            messages.append({
-                                "role": "system",
-                                "content": f"用户发送了一张图片，图片内容识别结果如下：\n{image_description}\n\n请用你自己的语气和人格风格，自然地向用户描述你看到了什么，不要直接复述识别结果，不要提及视觉模型或识别工具。"
-                            })
-                        else:
-                            messages.append({
-                                "role": "system",
-                                "content": "用户发送了一张图片，但视觉识别未能成功识别图片内容。请诚实地告诉用户你暂时看不清这张图片，不要编造图片内容，可以请用户描述一下图片里是什么。"
-                            })
+                    mime, img_b64 = encode_image_to_base64(img_path)
+                    image_description = await self._describe_images([{"mimeType": mime, "data": img_b64}])
+                    if image_description:
+                        messages.append({
+                            "role": "system",
+                            "content": f"用户发送了一张图片，图片内容识别结果如下：\n{image_description}\n\n请用你自己的语气和人格风格，自然地向用户描述你看到了什么，不要直接复述识别结果，不要提及视觉模型或识别工具。"
+                        })
                     else:
                         messages.append({
                             "role": "system",
-                            "content": "[系统提示] 用户发送了一张图片，但图片文件无法读取。请告诉用户你暂时无法查看这张图片。"
+                            "content": "用户发送了一张图片，但视觉识别未能成功识别图片内容。请诚实地告诉用户你暂时看不清这张图片，不要编造图片内容，可以请用户描述一下图片里是什么。"
                         })
+                except (FileNotFoundError, ValueError):
+                    messages.append({
+                        "role": "system",
+                        "content": "[系统提示] 用户发送了一张图片，但图片文件无法读取。请告诉用户你暂时无法查看这张图片。"
+                    })
                 except Exception as e:
                     logger.warning("agent.image_load_failed", error=str(e))
                     messages.append({
@@ -453,8 +354,7 @@ class AgentCore:
         if _sticker_intent and self.sticker_manager.available:
             _detected_e = self.sticker_manager.detect_emotion(clean_input)
             if not _detected_e:
-                _emap = {"喜悦": "happy", "悲伤": "sad", "焦虑": "sad", "平静": "", "愤怒": "angry", "好奇": "curious"}
-                _detected_e = _emap.get(emotion.get("primary", ""), "happy")
+                _detected_e = CN_TO_EN.get(emotion.get("primary", ""), "happy")
             _pre_picked_sticker = self.sticker_manager.pick(_detected_e)
             if _pre_picked_sticker:
                 _sticker_desc = _pre_picked_sticker.stem.replace("_", " ").replace("-", " ")
@@ -470,6 +370,15 @@ class AgentCore:
         if has_image and tools:
             tools = None
 
+        # 简单任务（问候/闲聊）时过滤掉系统级工具，避免模型自作主张查硬件等
+        # 但保留天气、搜索等用户可能期望模型主动使用的工具
+        tools = ChatProcessor.filter_tools_for_simple_task(tools, clean_input, self._is_simple_task)
+
+        # 表情包意图时禁用委托：sticker 由主体流程附带，委托出去反而丢失
+        if _sticker_intent and tools:
+            tools = [t for t in tools
+                     if t.get("function", {}).get("name") not in ("call_klee", "delegate_task")] or None
+
         should_escalate, reason = self._should_escalate_to_pro(user_input, tools)
         base_task = "chat_pro" if should_escalate else "chat"
         task_type = self.router.resolve_task_type(base_task)
@@ -479,8 +388,6 @@ class AgentCore:
 
         reply = ""
         tool_results = []
-        self._current_user_input = user_input
-        self._handled_by_tool_call = False
 
         _model_cfg = AGENT_CONFIG.get("model", {})
         is_owner = self.security.is_owner(user_id)
@@ -510,9 +417,9 @@ class AgentCore:
                             assistant_content=result,
                             reasoning_content=dsml_reasoning,
                             user_openid=user_openid, session_id=session_id,
-                            safe_mode=not is_owner,
+                            safe_mode=not is_owner, ctx=ctx,
                         )
-                        self._handled_by_tool_call = True
+                        ctx.handled_by_tool_call = True
                         logger.info("agent.got_dsml_tool_reply", length=len(reply), preview=reply[:80])
                     else:
                         reply = self._clean_reply(result)
@@ -534,9 +441,9 @@ class AgentCore:
                         assistant_content=msg.content or "",
                         reasoning_content=reasoning,
                         user_openid=user_openid, session_id=session_id,
-                        safe_mode=not is_owner,
+                        safe_mode=not is_owner, ctx=ctx,
                     )
-                    self._handled_by_tool_call = True
+                    ctx.handled_by_tool_call = True
                     logger.info("agent.got_tool_reply", length=len(reply), preview=reply[:80])
                 else:
                     reply = self._clean_reply(msg.content or "")
@@ -564,55 +471,66 @@ class AgentCore:
                 except Exception:
                     reply = DEGRADED_REPLY
 
-        if not self._handled_by_tool_call:
-            self.context.add_message("user", user_input)
-            rc = self.router.pop_reasoning_content()
-            self.context.add_message("assistant", reply, reasoning_content=rc)
+        # 从工具结果中提取媒体路径，并清理回复中的冗余路径描述
+        media_image_paths, media_video_path, reply = await self._extract_media_from_tool_results(tool_results, reply)
 
-        asyncio.create_task(self._background_tasks(
+        if not ctx.handled_by_tool_call:
+            await self.context.add_message("user", user_input)
+            rc = self.router.pop_reasoning_content()
+            await self.context.add_message("assistant", reply, reasoning_content=rc)
+
+        self._bg_task_manager.run_background_tasks(
             user_input, reply, user_id, source, emotion, tool_results,
             session_id=session_id,
-        ))
+        )
 
         try:
             await self.router.flush_costs()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"费用统计刷新失败，可能丢失费用数据: {e}")
 
         trace.info("agent.process.done", reply_preview=reply[:100])
 
         emotion_label = emotion.get("primary", "")
+
+        # 确保情绪标签存在且合法（LLM 可能漏标或标错）
+        if is_unified():
+            reply, ensured_emotion = ensure_emotion_tag(reply)
+            if ensured_emotion.value != emotion_label:
+                emotion_label = ensured_emotion.value
+
         if _pre_picked_sticker:
             clean_reply = self.sticker_manager.strip_emotion_tag(reply)
             sticker_path = _pre_picked_sticker
         else:
-            clean_reply, sticker_path = self.get_sticker_info(reply, self._last_user_emotion)
+            clean_reply, sticker_path = self.get_sticker_info(reply, ctx.last_user_emotion)
 
         audio_path = None
         should_generate_voice = self._voice_mode or force_voice
         if should_generate_voice and self.tts.available and len(clean_reply) > 2:
             try:
-                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply))
+                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply), emotion=emotion_label)
             except Exception as e:
                 logger.warning("agent.tts_failed", error=str(e))
 
         if audio_path:
             clean_reply = clean_reply + "\n\n🎙️ 语音消息已发送～"
 
-        return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path, tool_results=tool_results)
+        # PostResponse 钩子（批量后处理）
+        _spawn(self._hook_engine.fire_post_response())
+
+        return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path, tool_results=tool_results, image_paths=media_image_paths, video_path=media_video_path)
 
     async def process_text(self, user_input: str, user_openid: str = "cli", session_id: str = "cli") -> str:
         result = await self.process(user_input, user_id="cli_owner", source="cli", user_openid=user_openid, session_id=session_id)
         return result.reply
 
     def _should_escalate_to_pro(self, user_msg: str, tools: list | None) -> tuple[bool, str]:
-        tool_keywords = {"天气", "温度", "下雨", "搜索", "查一下", "帮我查",
-                         "你还记得", "写代码", "调试", "执行", "计算"}
+        tool_keywords = PRO_TASK_KEYWORDS["tool"]
         if tools and any(kw in user_msg for kw in tool_keywords):
             return True, "tool_likely_query"
 
-        negative = {"难过", "伤心", "崩溃", "绝望", "痛苦", "焦虑", "害怕",
-                    "孤独", "想哭", "受不了"}
+        negative = PRO_TASK_KEYWORDS["negative"]
         if any(kw in user_msg for kw in negative) and len(user_msg) > 30:
             return True, "deep_emotional_content"
 
@@ -621,79 +539,86 @@ class AgentCore:
 
         return False, ""
 
+    async def _execute_tool_with_hooks(self, tool_name: str, arguments: dict,
+                                        user_id: str = "", safe_mode: bool = False,
+                                        user_input: str = "") -> 'ToolResult':
+        """带钩子的工具执行"""
+        from tool_registry import ToolResult
+
+        # PreToolUse 钩子
+        hook_result = await self._hook_engine.fire_pre_tool_use(
+            tool_name=tool_name, arguments=arguments,
+            user_input=user_input, safe_mode=safe_mode
+        )
+        if not hook_result.allowed:
+            return ToolResult.fail(hook_result.reason or "工具执行被安全策略阻止")
+
+        # 使用修改后的参数（如果有）
+        actual_args = hook_result.modified_args or arguments
+
+        # WebUI 工具过程可视化（无 WebUI 时为 no-op）
+        import time as _time
+        _tool_t0 = _time.time()
+        try:
+            from web.tool_events import emit_tool_event
+            await emit_tool_event("start", tool_name, actual_args)
+        except Exception:
+            pass
+
+        # 工具护栏检查
+        from tool_guardrails import get_tool_guardrails
+        guardrails = get_tool_guardrails()
+        action, guard_msg = await guardrails.check(tool_name, arguments)
+        if action == "halt":
+            return ToolResult.fail(guard_msg)
+
+        # 执行工具
+        result = await self.tool_executor.execute(tool_name, actual_args, user_id, safe_mode)
+
+        try:
+            from web.tool_events import emit_tool_event
+            await emit_tool_event("end", tool_name, ok=result.success,
+                                  elapsed_ms=int((_time.time() - _tool_t0) * 1000))
+        except Exception:
+            pass
+
+        # 记录工具调用到护栏
+        await guardrails.record_call(tool_name, arguments, result.success,
+                               str(result.data)[:100] if result.data else "")
+
+        # PostToolUse 钩子
+        post_result = await self._hook_engine.fire_post_tool_use(
+            tool_name=tool_name, arguments=actual_args,
+            output=str(result.data) if result.data else result.error or "",
+            user_input=user_input
+        )
+
+        # 如果钩子修改了输出
+        if post_result.modified_output is not None:
+            if result.success:
+                return ToolResult.ok(post_result.modified_output)
+            else:
+                return ToolResult.fail(post_result.modified_output)
+
+        # 护栏警告注入
+        if action == "warn" and guard_msg:
+            # 在输出中注入警告
+            if result.success:
+                result = ToolResult.ok(f"[护栏警告: {guard_msg}]\n{result.data}")
+
+        return result
+
     async def _handle_tool_calls(self, tool_calls: list[dict], messages: list[dict],
                                   trace, *,
                                   assistant_content: str = "",
                                   reasoning_content: str | None = None,
                                   user_openid: str = "",
                                   session_id: str = "",
-                                  safe_mode: bool = False) -> tuple[str, list]:
-        self._tool_call_handler.set_status_callback(self._status_callback)
-        return await self._tool_call_handler.handle(tool_calls, messages, trace, assistant_content=assistant_content, reasoning_content=reasoning_content, user_openid=user_openid, session_id=session_id, safe_mode=safe_mode, current_user_input=self._current_user_input)
-
-    async def _background_tasks(self, user_input: str, reply: str,
-                                 user_id: str, source: str,
-                                 emotion: dict, tool_results: list,
-                                 session_id: str = "") -> None:
-        try:
-            await self.db.insert_conversation_log(
-                user_id=user_id,
-                source=source,
-                user_message=user_input,
-                assistant_reply=reply,
-                emotion_label=emotion.get("primary", ""),
-            )
-        except Exception as e:
-            logger.warning("bg.conversation_log_failed", error=str(e))
-
-        if session_id:
-            try:
-                await self.db.update_session(session_id)
-            except Exception as e:
-                logger.warning("bg.session_update_failed", error=str(e))
-
-        if self.memory and len(self.context.history) >= 4:
-            try:
-                ctx = {
-                    "exchanges": self.context.get_last_n(6),
-                    "emotion": emotion,
-                }
-                await self.memory.try_idle_encode(ctx)
-            except Exception as e:
-                logger.warning("bg.memory_encode_failed", error=str(e))
-
-        if self.notebook_manager:
-            _spawn(self.notebook_manager.auto_note_after_message(user_input, reply))
-
-        if self.portrait_manager:
-            self.portrait_manager.mark_dirty()
-
-        if self.portrait_manager and len(self.context.history) >= 4:
-            _spawn(self._portrait_cold_start())
-
-        if self.learning_manager:
-            _spawn(
-                self.learning_manager.evaluate_after_conversation(user_input, reply, tool_results)
-            )
-
-        _spawn(self._auto_archive_sessions())
-
-    async def _auto_archive_sessions(self) -> None:
-        try:
-            archived = await self.db.auto_archive_stale_sessions(idle_seconds=3600)
-            if archived > 0:
-                logger.info("session.auto_archived", count=archived)
-        except Exception as e:
-            logger.warning("session.auto_archive_failed", error=str(e))
-
-    async def _portrait_cold_start(self) -> None:
-        try:
-            result = await self.portrait_manager.ensure_exists()
-            if result:
-                self.context.user_portrait = result
-                logger.info("portrait.cold_start_done", length=len(result))
-        except Exception as e:
-            logger.warning("portrait.cold_start_failed", error=str(e))
+                                  safe_mode: bool = False,
+                                  ctx: RequestContext | None = None) -> tuple[str, list]:
+        _ctx = ctx or _current_request_ctx.get()
+        self._tool_call_handler.set_status_callback(_ctx.status_callback if _ctx else None)
+        return await self._tool_call_handler.handle(tool_calls, messages, trace, assistant_content=assistant_content, reasoning_content=reasoning_content, user_openid=user_openid, session_id=session_id, safe_mode=safe_mode, current_user_input=_ctx.user_input if _ctx else "", user_id=_ctx.user_id if _ctx else "")
 
     async def _load_notebook_context(self) -> None:
         try:
@@ -706,6 +631,79 @@ class AgentCore:
                 self.context.pending_tasks = tasks
         except Exception as e:
             logger.warning("notebook.context_load_failed", error=str(e))
+
+    async def _extract_media_from_tool_results(self, tool_results: list, reply: str) -> tuple[list[Path], Path | None, str]:
+        """从工具结果中提取图片/视频路径，并清理回复文本中的冗余路径描述。"""
+        image_paths: list[Path] = []
+        video_path: Path | None = None
+        extracted_paths: list[str] = []  # 用于清理回复文本
+
+        for result in tool_results:
+            if not result.success or not result.data:
+                continue
+            data_str = result.data if isinstance(result.data, str) else json.dumps(result.data, ensure_ascii=False)
+
+            # 提取图片路径：匹配 "图片已保存到: /path" 或 "图片URL: https://..."
+            for m in re.finditer(r'图片已保存到:\s*(\S+)', data_str):
+                try:
+                    p = Path(m.group(1))
+                    if p.exists():
+                        image_paths.append(p)
+                        extracted_paths.append(m.group(0))
+                        logger.info("media.extracted_image", path=str(p))
+                except Exception as e:
+                    logger.warning("media.image_path_parse_failed", raw=m.group(1), error=str(e))
+
+            for m in re.finditer(r'图片URL:\s*(\S+)', data_str):
+                try:
+                    url = m.group(1).rstrip('`')
+                    # 下载 URL 图片到本地，以便通过 QQ 富媒体消息发送
+                    try:
+                        import httpx
+                        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as dl_client:
+                            resp = await dl_client.get(url)
+                            resp.raise_for_status()
+                            img_dir = FILE_DIR if FILE_DIR.exists() else Path("tts_cache")
+                            img_dir.mkdir(parents=True, exist_ok=True)
+                            local_path = img_dir / f"agnes_dl_{int(time.time())}_{len(image_paths)}.png"
+                            local_path.write_bytes(resp.content)
+                            image_paths.append(local_path)
+                            logger.info("media.downloaded_image_url", url=url, local=str(local_path))
+                    except Exception as dl_err:
+                        logger.warning("media.image_url_download_failed", url=url, error=str(dl_err))
+                    extracted_paths.append(m.group(0))
+                except Exception as e:
+                    logger.warning("media.image_url_parse_failed", raw=m.group(1), error=str(e))
+
+            # 提取视频路径：匹配 "视频生成完成！本地路径: /path" 或 "视频已保存到: /path"
+            for m in re.finditer(r'(?:视频生成完成！本地路径|视频已保存到):\s*(\S+)', data_str):
+                try:
+                    p = Path(m.group(1))
+                    if p.exists() and video_path is None:
+                        video_path = p
+                        extracted_paths.append(m.group(0))
+                        logger.info("media.extracted_video", path=str(p))
+                except Exception as e:
+                    logger.warning("media.video_path_parse_failed", raw=m.group(1), error=str(e))
+
+        # 清理回复文本中包含已提取路径的行
+        clean_reply = reply
+        if extracted_paths:
+            lines = clean_reply.split('\n')
+            filtered_lines = []
+            for line in lines:
+                should_remove = False
+                for ep in extracted_paths:
+                    if ep in line:
+                        should_remove = True
+                        break
+                if not should_remove:
+                    filtered_lines.append(line)
+            clean_reply = '\n'.join(filtered_lines).strip()
+            # 清理可能残留的空行
+            clean_reply = re.sub(r'\n{3,}', '\n\n', clean_reply)
+
+        return image_paths, video_path, clean_reply
 
     def _clean_reply(self, text: str) -> str:
         text = text.strip()
@@ -727,15 +725,16 @@ class AgentCore:
             else:
                 detected = self.sticker_manager.detect_emotion(clean_reply)
                 if not detected and user_emotion:
-                    user_emotion_map = {"喜悦": "happy", "悲伤": "sad", "焦虑": "sad", "平静": ""}
-                    detected = user_emotion_map.get(user_emotion, "")
+                    detected = CN_TO_EN.get(user_emotion, "")
                 if self.sticker_manager.should_send(clean_reply, detected_emotion=detected):
                     sticker_path = self.sticker_manager.pick(detected)
         return clean_reply, sticker_path
 
     async def _dispatch_single_sub_agent(self, target: str, clean_input: str,
                                           user_id: str, source: str, session_id: str, trace,
-                                          force_voice: bool = False) -> ProcessResult:
+                                          force_voice: bool = False,
+                                          ctx: RequestContext | None = None) -> ProcessResult:
+        _ctx = ctx or _current_request_ctx.get()
         sub_agent = self.dispatcher.get_agent(target)
         if not sub_agent or not sub_agent.available:
             return ProcessResult(reply=f"{sub_agent.config.display_name if sub_agent else target}现在有点累了...等会儿再来吧！💤")
@@ -743,54 +742,48 @@ class AgentCore:
         display_name = sub_agent.config.display_name
         trace.info("agent.chat_target_sub", target=target, input_preview=clean_input[:50])
         context_str = self._build_sub_agent_context()
-        sub_reply = await self.dispatcher.dispatch(target, clean_input, context=context_str, status_callback=self._status_callback)
+        sub_reply = await self.dispatcher.dispatch(target, clean_input, context=context_str, status_callback=_ctx.status_callback if _ctx else None)
         if sub_reply is None:
             sub_reply = f"{display_name}现在有点累了...等会儿再来吧！💤"
 
         emotion = detect_emotion(clean_input)
-        self._last_user_emotion = emotion.get("primary", "")
-        asyncio.create_task(self._background_tasks(
+        if _ctx:
+            _ctx.last_user_emotion = emotion.get("primary", "")
+        # 子代理对话也写入主体历史：切回纳西妲或追问时上下文不断档
+        await self.context.add_message("user", clean_input)
+        await self.context.add_message("assistant", f"[{display_name}] {sub_reply}")
+        self._bg_task_manager.run_background_tasks(
             clean_input, sub_reply, user_id, source, emotion, [],
             session_id=session_id,
-        ))
+        )
 
         clean_sub_reply = self.klee_sticker_manager.strip_emotion_tag(sub_reply)
 
-        if self.router:
-            try:
-                nahida_prompt = getattr(self.context, "system_prompt", "") or ""
-                if not nahida_prompt and hasattr(self.context, "_system_prompt_loader") and self.context._system_prompt_loader:
-                    try:
-                        nahida_prompt = self.context._system_prompt_loader()
-                    except Exception:
-                        pass
-                if not nahida_prompt:
-                    nahida_prompt = "你是纳西妲，须弥的草神。"
-
-                summary = await self.router.route(
-                    "chat",
-                    [
-                        {"role": "system", "content": nahida_prompt},
-                        {"role": "user", "content": f"用户请求：{clean_input}"},
-                        {"role": "assistant", "content": f"（{display_name}的执行结果如下）\n\n{clean_sub_reply}"},
-                        {"role": "user", "content": f'请基于{display_name}的结果，用纳西妲的风格向用户汇报。要求：\n1. 提取关键信息，不要直接复制原始数据\n2. 用自然语言解释数据含义\n3. 如果有异常情况要指出\n4. 保持简洁\n5. ⚠️ 如果{display_name}返回的数据明显不完整（比如只有几个字、只有\'Listing...\'或\'Done\'、或者看起来像是未完成的输出），不要编造内容，而是如实告诉用户：{display_name}那边好像没传回完整的数据，建议让{display_name}重新执行一次。'},
-                    ],
-                    temperature=0.7,
-                    max_tokens=1024,
-                )
-                if isinstance(summary, str) and summary.strip():
-                    clean_sub_reply = self._clean_reply(summary)
-            except Exception as e:
-                logger.warning("agent.sub_synthesis_failed", error=str(e))
+        # 单Agent直接使用其回复，跳过nahida重新总结
 
         emotion_label = emotion.get("primary", "")
         sticker_path = None
+
+        # 子 Agent 表情包：使用对应的 sticker_manager
+        sub_sticker_mgr = self.klee_sticker_manager if target.lower() in ("keli", "klee") else self.sticker_manager
+        if sub_sticker_mgr.available:
+            # 1. 使用 sticker_manager 对子Agent的回复文本进行情绪检测
+            detected = sub_sticker_mgr.detect_emotion(clean_sub_reply)
+            # 2. 如果 sticker_manager 未检测到，使用 emotion_simple 对子Agent回复进行情绪检测
+            if not detected:
+                sub_reply_emotion = detect_emotion(clean_sub_reply)
+                sub_reply_emotion_label = sub_reply_emotion.get("primary", "")
+                if sub_reply_emotion_label:
+                    detected = CN_TO_EN.get(sub_reply_emotion_label, "")
+            # 3. 如果检测到情绪且 should_send() 返回 True，则 pick() 选择表情包
+            if sub_sticker_mgr.should_send(clean_sub_reply, detected_emotion=detected):
+                sticker_path = sub_sticker_mgr.pick(detected)
 
         sub_audio_path = None
         should_generate_voice = self._voice_mode or force_voice
         if should_generate_voice and len(clean_sub_reply) > 2:
             try:
-                sub_audio_path = await sub_agent.synthesize(self._clean_reply(clean_sub_reply))
+                sub_audio_path = await sub_agent.synthesize(self._clean_reply(clean_sub_reply), emotion=emotion_label)
             except Exception as e:
                 logger.warning("agent.sub_tts_failed", target=target, error=str(e))
 
@@ -801,14 +794,16 @@ class AgentCore:
 
     async def _dispatch_parallel_sub_agents(self, targets: list[str], clean_input: str,
                                             user_id: str, source: str, session_id: str, trace,
-                                            force_voice: bool = False) -> ProcessResult:
+                                            force_voice: bool = False,
+                                            ctx: RequestContext | None = None) -> ProcessResult:
+        _ctx = ctx or _current_request_ctx.get()
         trace.info("agent.parallel_dispatch", targets=targets, input_preview=clean_input[:50])
 
-        if self._status_callback:
+        if _ctx and _ctx.status_callback:
             try:
-                await self._status_callback(f"⚡ 并行调度中，同时启动 {len(targets)} 个Agent...")
-            except Exception:
-                pass
+                await _ctx.status_callback(f"⚡ 并行调度中，同时启动 {len(targets)} 个Agent...")
+            except Exception as e:
+                logger.warning(f"并行调度状态回调失败: {e}")
 
         agent_configs = self._agent_route_configs
         sub_context = self._build_sub_agent_context()
@@ -846,48 +841,23 @@ class AgentCore:
 
         all_replies = "\n\n".join([f"【{r['display_name']}】\n{r['reply']}" for r in intermediate])
         emotion = detect_emotion(clean_input)
-        self._last_user_emotion = emotion.get("primary", "")
-        asyncio.create_task(self._background_tasks(
+        if _ctx:
+            _ctx.last_user_emotion = emotion.get("primary", "")
+        self._bg_task_manager.run_background_tasks(
             clean_input, all_replies, user_id, source, emotion, [],
             session_id=session_id,
-        ))
+        )
 
-        if self.router:
-            try:
-                agent_names = "、".join([r['display_name'] for r in intermediate])
-                nahida_prompt = getattr(self.context, "system_prompt", "") or ""
-                if not nahida_prompt and hasattr(self.context, "_system_prompt_loader") and self.context._system_prompt_loader:
-                    try:
-                        nahida_prompt = self.context._system_prompt_loader()
-                    except Exception:
-                        pass
-                if not nahida_prompt:
-                    nahida_prompt = "你是纳西妲，须弥的草神。"
-
-                summary = await self.router.route(
-                    "chat",
-                    [
-                        {"role": "system", "content": nahida_prompt},
-                        {"role": "user", "content": f"用户请求：{clean_input}"},
-                        {"role": "assistant", "content": f"（{agent_names}的并行执行结果如下）\n\n{all_replies}"},
-                        {"role": "user", "content": f'以上是{len(intermediate)}位团队成员的并行工作结果，请你整理后向用户做一份完整的汇报：\n1. 先给出一个总体概述（一句话总结全局情况）\n2. 然后按每个团队成员分板块汇报，提取所有具体的事实、数据和关键信息\n3. 最后给出综合评估或建议\n4. 语气温柔但内容必须充实\n5. 如果某个Agent结果明显不完整或报错，如实说明'},
-                    ],
-                    temperature=0.7,
-                    max_tokens=2048,
-                )
-                if isinstance(summary, str) and summary.strip():
-                    all_replies = self._clean_reply(summary)
-            except Exception as e:
-                logger.warning("agent.parallel_synthesis_failed", error=str(e))
+        # 并行结果直接使用，跳过nahida重新总结（SynthesisNode已负责综合）
 
         emotion_label = emotion.get("primary", "")
-        clean_reply, sticker_path = self.get_sticker_info(all_replies, self._last_user_emotion)
+        clean_reply, sticker_path = self.get_sticker_info(all_replies, _ctx.last_user_emotion if _ctx else "")
 
         audio_path = None
         should_generate_voice = self._voice_mode or force_voice
         if should_generate_voice and self.tts.available and len(clean_reply) > 2:
             try:
-                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply))
+                audio_path = await self.tts.synthesize_nahida(self._clean_reply(clean_reply), emotion=emotion_label)
             except Exception as e:
                 logger.warning("agent.parallel_tts_failed", error=str(e))
 
@@ -896,12 +866,29 @@ class AgentCore:
 
         return ProcessResult(reply=clean_reply, emotion=emotion_label, sticker_path=sticker_path, audio_path=audio_path)
 
+    async def delegate_to_agent(self, name: str, task: str) -> str:
+        """通用子代理委托（delegate_task 工具的执行端）。"""
+        if name in ("keli", "klee"):
+            return await self.delegate_to_klee(task)
+        _ctx = _current_request_ctx.get()
+        agent = self.dispatcher.get_agent(name)
+        if not agent:
+            return f"（找不到名为 {name} 的子代理）"
+        context = self._build_sub_agent_context()
+        result = await self.dispatcher.dispatch(
+            name, task, context=context,
+            status_callback=_ctx.status_callback if _ctx else None)
+        if result is None:
+            return f"{agent.config.display_name}现在有点累了...等会儿再试吧💤"
+        return result
+
     async def delegate_to_klee(self, task: str, factual: bool = False) -> str:
+        _ctx = _current_request_ctx.get()
         if factual:
             context = "这是纳西妲委托的查询任务。请直接返回查询结果，不要加任何个人风格、感叹号或角色扮演，只报告事实数据。"
         else:
             context = "纳西妲姐姐委托可莉的任务。纳西妲是须弥的草神，温柔聪慧，可莉叫她'纳西妲姐姐'。用户是纳西妲的爸爸，也是可莉的大哥哥/大姐姐。"
-        result = await self.dispatcher.dispatch("keli", task, context=context, status_callback=self._status_callback)
+        result = await self.dispatcher.dispatch("keli", task, context=context, status_callback=_ctx.status_callback if _ctx else None)
         if result is None:
             return "可莉现在有点累了...等会儿再来找大哥哥玩吧！蹦蹦...💤"
         return result
@@ -951,34 +938,31 @@ class AgentCore:
             return klee_result
 
     async def _notify_status(self, message: str):
-        if self._status_callback:
+        _ctx = _current_request_ctx.get()
+        if _ctx and _ctx.status_callback:
             try:
-                await self._status_callback(message)
-            except Exception:
-                pass
+                await _ctx.status_callback(message)
+            except Exception as e:
+                logger.warning(f"状态回调通知失败: {e}")
 
     def _is_manual_target(self, user_input: str, user_id: str) -> bool:
         return any(tag in user_input for tag in ["@可莉", "@银狼", "@昔涟", "@尼可", "@纳西妲"])
 
     def _is_simple_task(self, user_input: str) -> bool:
-        complex_keywords = [
-            "搜索", "查一下", "帮我查", "找一下", "搜一下", "查查", "帮我找",
-            "搜索一下", "查资料", "搜资料", "写代码", "编程", "调试",
-            "研究", "分析", "计算", "执行", "运行", "安装", "部署",
-            "翻译", "转换", "制作", "设计",
-            "怎么看", "怎么弄", "如何", "怎么办", "帮我看", "帮我看看",
-            "检查", "巡检", "测试", "优化", "修复", "bug", "报错",
+        # 否定指令（告诉助手不要做某事）优先判断，属于简单对话，不应路由到子Agent
+        negative_patterns = [
+            r"(?:不|别|不要|不用|不需要|没必要)\s*(?:要|用|调用|查|检查|执行|运行|搜索|搜|找|看)",
+            r"(?:不需要|不用|别)\s*(?:调用|使用)\s*(?:这个|那个|任何)?\s*(?:工具|功能)",
         ]
+        if any(re.search(pat, user_input) for pat in negative_patterns):
+            return True
+
+        complex_keywords = SIMPLE_TASK_KEYWORDS["complex"]
         if any(kw in user_input for kw in complex_keywords):
             return False
 
         # 对话性消息关键词 — 这些是日常聊天，不是复杂任务
-        chat_keywords = [
-            "这是", "那是", "这个是", "那个是", "不是", "不对", "错了",
-            "你好", "谢谢", "晚安", "早安", "早上好", "晚上好",
-            "哈哈", "嘿嘿", "嗯嗯", "好的", "好吧", "算了",
-            "你知道吗", "告诉你", "跟你说", "我说",
-        ]
+        chat_keywords = SIMPLE_TASK_KEYWORDS["chat"]
         if any(kw in user_input for kw in chat_keywords):
             return True
 
@@ -1065,77 +1049,29 @@ class AgentCore:
             logger.warning("agent.nahida_synthesis_failed", error=str(e))
             return prompt
 
-    def _parse_chat_target(self, user_input: str, user_id: str) -> list[str]:
-        targets = []
-        if "@可莉" in user_input:
-            targets.append("keli")
-        if "@银狼" in user_input:
-            targets.append("yinlang")
-        if "@昔涟" in user_input:
-            targets.append("xilian")
-        if "@尼可" in user_input:
-            targets.append("nike")
-        if "@纳西妲" in user_input:
-            targets.append("nahida")
+    async def _parse_chat_target(self, user_input: str, user_id: str) -> list[str]:
+        decision = self._router_engine.decide(user_input, user_id)
+        if decision.agent_names:
+            async with self._chat_target_lock:
+                self._user_chat_target[user_id] = decision.agent_names[-1]
+        logger.debug("router.decision", agents=decision.agent_names,
+                     mode=decision.mode, reason=decision.reasoning)
+        return decision.agent_names
 
-        if targets:
-            self._user_chat_target[user_id] = targets[-1]
-            return targets
+    async def get_chat_target(self, user_id: str) -> str:
+        async with self._chat_target_lock:
+            return self._user_chat_target.get(user_id, "nahida")
 
-        q = user_input.lower()
-
-        negative_patterns = [
-            r"(?:不|别|不要|不用)\s*(?:让|叫|请)?\s*(?:可莉|klee|银狼|yinlang|昔涟|xilian|尼可|nike)",
-        ]
-        for pat in negative_patterns:
-            if re.search(pat, q):
-                self._user_chat_target[user_id] = "nahida"
-                return ["nahida"]
-
-        self_target_patterns = [
-            (r"(?:你|你自己|亲自)(?:去|来|帮我|帮我查|查|搜|找|看看|检查)", "nahida"),
-        ]
-        for pattern, target in self_target_patterns:
-            if re.search(pattern, q):
-                self._user_chat_target[user_id] = target
-                return [target]
-
-        voice_patterns = [
-            r"(?:语音|声音|说话|朗读|念|读|听你|听听|发语音|生成语音|语音回复|说给我听|念出来)",
-        ]
-        for pattern in voice_patterns:
-            if re.search(pattern, q):
-                self._user_chat_target[user_id] = "nahida"
-                return ["nahida"]
-
-        patterns = [
-            (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:银狼|yinlang)", "yinlang"),
-            (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:可莉|klee|小炸弹)", "keli"),
-            (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:昔涟|xilian|记忆)", "xilian"),
-            (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:尼可|nike)", "nike"),
-            (r"(?:让|叫|请|麻烦|找|切换到)\s*(?:纳西妲|草神|小草神)", "nahida"),
-            (r"(?:银狼|yinlang)(?:帮|来|去|看一下|看看|检查|巡检|执行|处理)", "yinlang"),
-            (r"(?:可莉|klee|小炸弹)(?:帮|来|去|炸|boom)", "keli"),
-            (r"(?:昔涟|xilian)(?:帮|搜|查|找|搜索)", "xilian"),
-            (r"(?:尼可|nike)(?:帮|研究|分析|计算)", "nike"),
-        ]
-        for pattern, target in patterns:
-            if re.search(pattern, q):
-                self._user_chat_target[user_id] = target
-                return [target]
-
-        return ["nahida"]
-
-    def get_chat_target(self, user_id: str) -> str:
-        return self._user_chat_target.get(user_id, "nahida")
-
-    def set_chat_target(self, user_id: str, target: str):
-        self._user_chat_target[user_id] = target
+    async def set_chat_target(self, user_id: str, target: str):
+        async with self._chat_target_lock:
+            self._user_chat_target[user_id] = target
 
     async def _nahida_delegate_for_klee(self, question: str) -> str:
-        if self._delegate_depth >= 2:
+        _ctx = _current_request_ctx.get()
+        if _ctx and _ctx.delegate_depth >= 2:
             return "纳西妲姐姐现在也在忙，可莉先自己想想办法吧！"
-        self._delegate_depth += 1
+        if _ctx:
+            _ctx.delegate_depth += 1
         try:
             reply = await self.router.route(
                 "chat_flash",
@@ -1150,7 +1086,8 @@ class AgentCore:
         except Exception:
             return "纳西妲姐姐现在有点忙，等会儿再问她吧！"
         finally:
-            self._delegate_depth -= 1
+            if _ctx:
+                _ctx.delegate_depth -= 1
 
     async def get_session(self, user_openid: str) -> dict | None:
         return await self.db.get_active_session(user_openid)
@@ -1162,7 +1099,12 @@ class AgentCore:
         return await self.file_receiver.receive(attachment)
 
     def strip_emotion_tag(self, text: str) -> str:
-        return self.sticker_manager.strip_emotion_tag(text)
+        # 先提取情绪值（供 sticker_manager 使用）
+        result = self.sticker_manager.strip_emotion_tag(text)
+        # 兜底：强制剥离所有 [emotion:xxx] 标签（防止 LLM 在句中/句尾输出标签泄露给用户）
+        import re
+        result = re.sub(r'\[emotion:[^\]]*\]', '', result).strip()
+        return result
 
     def set_voice_mode(self, enabled: bool):
         self._voice_mode = enabled
@@ -1170,8 +1112,84 @@ class AgentCore:
     def get_voice_mode(self) -> bool:
         return self._voice_mode
 
+    async def set_permission_mode(self, mode: str) -> None:
+        """设置权限模式"""
+        from permission_manager import get_permission_manager, PermissionMode
+        pm = get_permission_manager()
+        pm.set_mode(mode)
+
+    async def get_context_usage(self) -> dict:
+        """获取当前上下文窗口使用情况"""
+        from context_usage import compute_context_usage
+        from dataclasses import asdict
+
+        # 获取系统提示词
+        system_prompt = ""
+        if self.context._system_prompt_loader:
+            system_prompt = self.context._system_prompt_loader()
+        elif self.context.system_prompt:
+            system_prompt = self.context.system_prompt
+
+        # 获取工具定义
+        tools_json = json.dumps(to_openai_tools(), ensure_ascii=False)
+
+        # 获取对话历史
+        messages = self.context.history
+
+        # 获取模型信息
+        model = self.router.get_model_preference_label() if self.router else ""
+
+        result = compute_context_usage(
+            system_prompt=system_prompt,
+            tools_json=tools_json,
+            messages=messages,
+            model=model,
+        )
+        return asdict(result)
+
     async def shutdown(self) -> None:
-        if self.router:
-            await self.router.flush_costs()
-        if self.db:
-            await self.db.close()
+        """安全释放所有资源，不抛异常。"""
+        try:
+            # Stop MCP servers
+            if self._mcp_manager:
+                await self._mcp_manager.stop_all()
+        except Exception as e:
+            logger.warning("shutdown.mcp_stop_failed", error=str(e))
+
+        try:
+            # 取消所有后台任务
+            bg_tasks = BackgroundTaskManager.get_bg_tasks()
+            for task in list(bg_tasks):
+                if not task.done():
+                    task.cancel()
+            if bg_tasks:
+                await asyncio.gather(*bg_tasks, return_exceptions=True)
+            BackgroundTaskManager.clear_bg_tasks()
+        except Exception as e:
+            logger.warning("shutdown.cancel_bg_tasks_failed", error=str(e))
+
+        try:
+            if self.router:
+                await self.router.flush_costs()
+        except Exception as e:
+            logger.warning("shutdown.flush_costs_failed", error=str(e))
+
+        try:
+            if self._vec_store and hasattr(self._vec_store, 'close'):
+                await self._vec_store.close()
+        except Exception as e:
+            logger.warning("shutdown.vec_store_close_failed", error=str(e))
+
+        try:
+            if self.tts and hasattr(self.tts, 'close'):
+                await self.tts.close()
+        except Exception as e:
+            logger.warning("shutdown.tts_close_failed", error=str(e))
+
+        try:
+            if self.db:
+                await self.db.close()
+        except Exception as e:
+            logger.warning("shutdown.db_close_failed", error=str(e))
+
+        logger.info("agent_core.shutdown_complete")

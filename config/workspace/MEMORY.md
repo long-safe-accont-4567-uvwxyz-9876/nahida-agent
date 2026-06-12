@@ -2,17 +2,17 @@
 
 ## 项目信息
 
-- 旅行者的 AI Agent 项目位于 /home/orangepi/ai-agent/
-- 使用 LangChain + DeepSeek 作为 LLM 后端
+- 爸爸的 AI Agent 项目位于 /home/orangepi/ai-agent/
+- 使用 MiMo (mimo-v2.5) 作为主 LLM 后端
 - QQ Bot 使用 qq-botpy 框架
 - 运行设备：Orange Pi（ARM Linux）
 - 工作区配置：~/.ai-agent/workspace/
 
 ## 重要事件
 
-（纳西妲会在这里记录旅行者确认过的重要信息和结论）
+（纳西妲会在这里记录爸爸确认过的重要信息和结论）
 
-## 旅行者的技术偏好
+## 爸爸的技术偏好
 
 - 偏好 Python 生态
 - 喜欢简洁直接的代码风格

@@ -1,5 +1,7 @@
 import random
 import re
+import base64
+from pathlib import Path
 
 AI_PATTERNS = [
     (r'此外[，,]?\s*', ''),
@@ -205,6 +207,15 @@ def smart_truncate(text: str, max_len: int = 2000) -> str:
     return truncated
 
 
+_SEGMENT_CONTINUATIONS = [
+    "（继续～）",
+    "（接着说～）",
+    "（还有呢～）",
+    "（还没完哦～）",
+    "（继续往下～）",
+]
+
+
 def split_long_reply(text: str, max_len: int = 2000) -> list[str]:
     encoded = text.encode('utf-8')
     if len(encoded) <= QQ_MSG_BYTE_LIMIT:
@@ -245,4 +256,44 @@ def split_long_reply(text: str, max_len: int = 2000) -> list[str]:
         segments.append(chunk)
         remaining = remaining[best_pos:].lstrip('\n')
 
+    # 为中间段添加轻量衔接词（保持纳西妲语气）
+    if len(segments) > 1:
+        for i in range(len(segments) - 1):
+            hint = random.choice(_SEGMENT_CONTINUATIONS)
+            segments[i] = segments[i].rstrip() + "\n" + hint
+
     return segments
+
+
+_IMAGE_MIME_MAP = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def encode_image_to_base64(image_path: str) -> tuple[str, str]:
+    """将图片文件编码为 base64 字符串，并返回对应的 MIME 类型。
+
+    Args:
+        image_path: 图片文件的路径
+
+    Returns:
+        tuple[str, str]: (mime_type, base64_string)
+
+    Raises:
+        FileNotFoundError: 文件不存在
+        ValueError: 文件超过大小限制
+    """
+    p = Path(image_path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"图片文件不存在: {image_path}")
+    if p.stat().st_size > _MAX_IMAGE_SIZE:
+        raise ValueError(f"图片文件超过 {_MAX_IMAGE_SIZE // (1024*1024)} MB 限制: {image_path}")
+    mime = _IMAGE_MIME_MAP.get(p.suffix.lower(), "image/jpeg")
+    img_b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return mime, img_b64

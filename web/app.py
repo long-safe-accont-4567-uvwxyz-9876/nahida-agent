@@ -1,4 +1,5 @@
 import asyncio
+import os
 import streamlit as st
 from agent_core import AgentCore
 
@@ -8,8 +9,29 @@ st.set_page_config(
     layout="wide"
 )
 
+# === 密码认证 ===
+WEBUI_PASSWORD = os.environ.get("WEBUI_PASSWORD", "")
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if WEBUI_PASSWORD:
+    if not st.session_state.authenticated:
+        st.title("🤖 AI Agent")
+        st.markdown("---")
+        pwd = st.text_input("请输入访问密码", type="password", key="login_pwd")
+        if st.button("登录"):
+            if pwd == WEBUI_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("密码错误，请重试")
+        st.stop()
+else:
+    st.warning("⚠️ 未设置 WEBUI_PASSWORD 环境变量，任何人都可以访问此界面。建议设置密码以保护安全。")
+
 st.title("🤖 全能型 AI Agent")
-st.caption("运行在 Orange Pi 上的智能助手 | 系统操作 • 文件管理 • 网络搜索 • 代码执行")
+st.caption("智能助手 | 系统操作 • 文件管理 • 网络搜索 • 代码执行")
 
 if "agent" not in st.session_state:
     with st.spinner("正在初始化 AI Agent..."):
@@ -31,16 +53,16 @@ with st.sidebar:
     - 读取/写入文件
     - 搜索文件
     - 执行 Shell 命令
-    
+
     **💻 代码执行**
     - Python 代码运行
     - 数学计算
-    
+
     **🌐 网络工具**
     - 网络搜索
     - 天气查询
     """)
-    
+
     st.header("💡 使用示例")
     st.markdown("""
     - "列出主目录的文件"
@@ -50,23 +72,33 @@ with st.sidebar:
     - "执行代码：打印九九乘法表"
     - "北京今天天气怎么样"
     """)
-    
+
     if st.button("清空对话"):
         st.session_state.messages = []
         st.rerun()
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        if message["role"] == "user":
+            st.text(message["content"])
+        else:
+            st.markdown(message["content"], unsafe_allow_html=False)
 
 if prompt := st.chat_input("输入你的问题..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
-        st.markdown(prompt)
-    
+        st.text(prompt)
+
     with st.chat_message("assistant"):
         with st.spinner("思考中..."):
-            response = st.session_state._loop.run_until_complete(st.session_state.agent.process_text(prompt))
-            st.markdown(response)
-    
-    st.session_state.messages.append({"role": "assistant", "content": response})
+            result = st.session_state._loop.run_until_complete(st.session_state.agent.process(prompt))
+            st.markdown(result.reply, unsafe_allow_html=False)
+            if result.image_paths:
+                for img_path in result.image_paths:
+                    st.image(str(img_path))
+            if result.audio_path:
+                st.audio(str(result.audio_path))
+            if result.sticker_path:
+                st.image(str(result.sticker_path))
+
+    st.session_state.messages.append({"role": "assistant", "content": result.reply})

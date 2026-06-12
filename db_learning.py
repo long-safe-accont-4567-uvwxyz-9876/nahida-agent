@@ -9,10 +9,14 @@ class LearningDB:
         self._conn = conn
         conn.row_factory = aiosqlite.Row
 
+    async def commit(self):
+        await self._conn.commit()
+
     async def insert_learning(self, category: str, priority: str, summary: str,
                                details: str = "", suggested_action: str = "",
                                source: str = "conversation",
-                               pattern_key: str = "") -> str:
+                               pattern_key: str = "",
+                               auto_commit: bool = True) -> str:
         now = time.time()
         date_str = time.strftime("%Y%m%d", time.localtime(now))
         learning_id = f"LRN-{date_str}-{int(now % 10000):04d}"
@@ -26,9 +30,11 @@ class LearningDB:
                 (learning_id, category, priority, summary, details,
                  suggested_action, source, pattern_key, now, now, now),
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
             return learning_id
-        except Exception:
+        except Exception as e:
+            logger.warning("db_learning.insert_learning_failed", error=str(e), summary=summary)
             return ""
 
     async def find_learning_by_pattern(self, pattern_key: str) -> dict | None:
@@ -41,7 +47,8 @@ class LearningDB:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def bump_learning_recurrence(self, learning_id: str) -> bool:
+    async def bump_learning_recurrence(self, learning_id: str,
+                                        auto_commit: bool = True) -> bool:
         now = time.time()
         cursor = await self._conn.execute(
             """UPDATE learnings
@@ -49,23 +56,28 @@ class LearningDB:
                WHERE learning_id=?""",
             (now, learning_id),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.rowcount > 0
 
-    async def resolve_learning(self, learning_id: str, resolution: str = "") -> bool:
+    async def resolve_learning(self, learning_id: str, resolution: str = "",
+                                auto_commit: bool = True) -> bool:
         cursor = await self._conn.execute(
             "UPDATE learnings SET status='resolved' WHERE learning_id=?",
             (learning_id,),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.rowcount > 0
 
-    async def promote_learning(self, learning_id: str, target: str = "system_prompt") -> bool:
+    async def promote_learning(self, learning_id: str, target: str = "system_prompt",
+                                auto_commit: bool = True) -> bool:
         cursor = await self._conn.execute(
             "UPDATE learnings SET status='promoted' WHERE learning_id=?",
             (learning_id,),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.rowcount > 0
 
     async def get_promoted_learnings(self) -> list[dict]:
@@ -109,7 +121,8 @@ class LearningDB:
 
     async def insert_error(self, summary: str, error_text: str = "",
                             context: str = "", suggested_fix: str = "",
-                            priority: str = "high") -> str:
+                            priority: str = "high",
+                            auto_commit: bool = True) -> str:
         now = time.time()
         date_str = time.strftime("%Y%m%d", time.localtime(now))
         error_id = f"ERR-{date_str}-{int(now % 10000):04d}"
@@ -122,13 +135,16 @@ class LearningDB:
                 (error_id, priority, summary, error_text[:500], context[:300],
                  suggested_fix, now),
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
             return error_id
-        except Exception:
+        except Exception as e:
+            logger.warning("db_learning.insert_error_failed", error=str(e), summary=summary)
             return ""
 
     async def insert_feature_request(self, capability: str, user_context: str = "",
-                                      complexity: str = "medium") -> str:
+                                      complexity: str = "medium",
+                                      auto_commit: bool = True) -> str:
         now = time.time()
         date_str = time.strftime("%Y%m%d", time.localtime(now))
         request_id = f"FEAT-{date_str}-{int(now % 10000):04d}"
@@ -140,7 +156,9 @@ class LearningDB:
                    VALUES (?, 'medium', 'pending', ?, ?, ?, 'first_time', ?)""",
                 (request_id, capability, user_context[:300], complexity, now),
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
             return request_id
-        except Exception:
+        except Exception as e:
+            logger.warning("db_learning.insert_feature_request_failed", error=str(e), capability=capability)
             return ""

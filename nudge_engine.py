@@ -1,6 +1,8 @@
 import asyncio
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from loguru import logger
 
 from db_analytics import AnalyticsDB
@@ -24,6 +26,8 @@ class NudgeEngine:
         self._last_user_message_time = time.time()
         self._last_proactive_time = 0
         self._last_portrait_consolidate = 0
+        self._last_promote_check: float = 0
+        self._last_cleanup_check: float = 0
         self._running = False
         self._task = None
         self._proactive_count_today = 0
@@ -54,6 +58,8 @@ class NudgeEngine:
 
     def poke(self):
         self._last_user_message_time = time.time()
+        # 用户活跃时重置主动消息冷却，避免长时间离开后冷却仍阻止问候
+        self._last_proactive_time = 0
 
     async def _loop(self):
         while self._running:
@@ -69,6 +75,12 @@ class NudgeEngine:
         if self._is_dnd():
             return
 
+        # 定期检查学习晋升（每10分钟）
+        await self._check_auto_promote()
+
+        # 定期数据清理（每天一次）
+        await self._check_data_cleanup()
+
         # Global cooldown: prevent ANY proactive message if recently sent
         if time.time() - self._last_proactive_time < self.MIN_PROACTIVE_INTERVAL:
             await self._check_portrait_consolidate()
@@ -83,7 +95,12 @@ class NudgeEngine:
         await self._check_portrait_consolidate()
 
     def _is_dnd(self) -> bool:
-        hour = datetime.now().hour
+        tz_name = os.getenv("NUDGE_TIMEZONE", "Asia/Shanghai")
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("Asia/Shanghai")
+        hour = datetime.now(tz).hour
         if self.dnd_start > self.dnd_end:
             return hour >= self.dnd_start or hour < self.dnd_end
         return self.dnd_start <= hour < self.dnd_end
@@ -148,7 +165,10 @@ class NudgeEngine:
                 {"role": "system", "content": "你是纳西妲，一个温柔可爱的小草神，正在给爸爸发主动问候消息。只输出消息内容，不要加引号或其他格式。"},
                 {"role": "user", "content": prompt},
             ]
-            result = await self._router.route("chat", messages, temperature=0.9)
+            result = await asyncio.wait_for(
+                self._router.route("chat", messages, temperature=0.9),
+                timeout=15,
+            )
             if isinstance(result, str):
                 greeting = result.strip()
             else:
@@ -190,10 +210,38 @@ class NudgeEngine:
                     msg += f"（{due_str}）"
                 msg += "，别忘了哦～"
 
-                await self._send_proactive(msg, "reminder")
-                await self._db.notebook.complete_task(task["id"])
+                sent = await self._send_proactive(msg, "reminder")
+                if sent:
+                    await self._db.notebook.remind_task(task["id"])
+                    await self._db.notebook.complete_task(task["id"])
         except Exception as e:
             logger.warning("nudge.reminder_check_failed", error=str(e))
+
+    async def _check_auto_promote(self):
+        now = time.time()
+        if now - self._last_promote_check < 600:  # 10分钟
+            return
+        self._last_promote_check = now
+        try:
+            if hasattr(self._db, 'learning') and hasattr(self._db, '_conn'):
+                from learning_manager import LearningManager
+                lm = LearningManager(self._db, self._db.learning, self._router)
+                await lm.auto_promote()
+        except Exception as e:
+            logger.debug("nudge.auto_promote_failed", error=str(e))
+
+    async def _check_data_cleanup(self):
+        now = time.time()
+        if now - self._last_cleanup_check < 86400:  # 24小时
+            return
+        self._last_cleanup_check = now
+        try:
+            if hasattr(self._db, 'cleanup_expired_data'):
+                result = await self._db.cleanup_expired_data()
+                if any(v > 0 for v in result.values()):
+                    logger.info("nudge.data_cleanup_done", **result)
+        except Exception as e:
+            logger.warning("nudge.data_cleanup_failed", error=str(e))
 
     async def _check_portrait_consolidate(self):
         if not self._portrait_manager:
@@ -212,8 +260,10 @@ class NudgeEngine:
                 self._last_portrait_consolidate = now
         except Exception as e:
             logger.warning("nudge.portrait_consolidate_failed", error=str(e))
+            # 失败时使用5分钟短回退，而非重置为完整30分钟间隔
+            self._last_portrait_consolidate = now - 1800 + 300
 
-    async def _send_proactive(self, content: str, msg_type: str):
+    async def _send_proactive(self, content: str, msg_type: str) -> bool:
         try:
             await self._api.post_c2c_message(
                 openid=self._user_openid,
@@ -228,8 +278,10 @@ class NudgeEngine:
             self._last_proactive_time = time.time()
             self._proactive_count_today += 1
             logger.info("nudge.sent", type=msg_type, content=content[:60], count_today=self._proactive_count_today)
+            return True
         except Exception as e:
             logger.warning("nudge.send_failed", type=msg_type, error=str(e))
+            return False
 
     def get_time_greeting(self) -> str:
         hour = datetime.now().hour

@@ -2,7 +2,35 @@ import time
 from loguru import logger
 
 
-OWNER_ONLY_COMMANDS = {"/model", "/reset", "/agent"}
+OWNER_ONLY_COMMANDS = {"/model", "/reset", "/agent", "/debug"}
+
+COMMAND_DESCRIPTIONS = {
+    "/cost": "查看 API 消费成本（可加 7d）",
+    "/status": "查看运行时状态",
+    "/model": "切换模型",
+    "/forget": "删除指定记忆",
+    "/reset": "系统重置",
+    "/learn": "学习管理",
+    "/note": "笔记管理",
+    "/help": "命令帮助",
+    "/voice": "语音回复开关",
+    "/agent": "切换子代理",
+    "/hw": "硬件状态",
+    "/sys": "系统命令",
+    "/cam": "摄像头控制",
+    "/memory": "记忆统计",
+    "/emotion": "情绪检测",
+    "/knowledge": "知识图谱查询",
+    "/debug": "调试信息",
+}
+
+
+def list_commands() -> list[dict]:
+    """供 Web UI 斜杠命令自动补全使用。"""
+    return [
+        {"name": name, "description": desc, "owner_only": name in OWNER_ONLY_COMMANDS}
+        for name, desc in COMMAND_DESCRIPTIONS.items()
+    ]
 
 
 class SlashCommandHandler:
@@ -57,6 +85,10 @@ class SlashCommandHandler:
             "/hw": self._cmd_hw,
             "/sys": self._cmd_sys,
             "/cam": self._cmd_cam,
+            "/memory": self._cmd_memory,
+            "/emotion": self._cmd_emotion,
+            "/knowledge": self._cmd_knowledge,
+            "/debug": self._cmd_debug,
         }
 
         handler = handlers.get(command)
@@ -155,10 +187,16 @@ class SlashCommandHandler:
             if self._agent and hasattr(self._agent, 'klee'):
                 self._agent.klee.set_preferred_provider("mimo")
             return "已切换到 MiMo Pro 模式 🧠（使用小米 MiMo-V2.5-Pro 深度思考）"
+        elif args in ("mimo-flash", "flash", "mimo_flash"):
+            self._router.set_model_preference("mimo-flash")
+            return "已切换到 MiMo Flash 模式 ⚡（使用小米 MiMo-V2.5 快速响应）"
+        elif args in ("mimo-mini", "mini", "mimo_mini"):
+            self._router.set_model_preference("mimo-mini")
+            return "已切换到 MiMo Mini 模式 🐣（使用小米 MiMo-V2.5 轻量任务）"
         else:
             pref = self._router.get_model_preference()
             label = self._router.get_model_preference_label()
-            return f"当前: {label}\n用法: /model [mimo|mimo-pro]"
+            return f"当前: {label}\n用法: /model [mimo|mimo-pro|mimo-flash|mimo-mini]"
 
     async def _cmd_forget(self, args: str, user_id: str) -> str:
         if not self._context:
@@ -264,7 +302,7 @@ class SlashCommandHandler:
         agents = self._agent.dispatcher.list_agents()
 
         if not args:
-            target = self._agent.get_chat_target(user_id)
+            target = await self._agent.get_chat_target(user_id)
             target_display = "纳西妲" if target == "nahida" else target
             lines = [f"当前对话目标: {target_display}"]
             if agents:
@@ -275,12 +313,12 @@ class SlashCommandHandler:
             return "\n".join(lines)
 
         if args in ("纳西妲", "nahida"):
-            self._agent.set_chat_target(user_id, "nahida")
+            await self._agent.set_chat_target(user_id, "nahida")
             return "已切换到纳西妲 🌿"
 
         for a in agents:
             if args in (a["display_name"], a["name"]):
-                self._agent.set_chat_target(user_id, a["name"])
+                await self._agent.set_chat_target(user_id, a["name"])
                 return f"已切换到{a['display_name']} 🔥"
 
         return f"没找到叫「{args}」的Agent哦～\n用法: /agent [名称]"
@@ -301,14 +339,16 @@ class SlashCommandHandler:
                 elif temp_c > 60:
                     temp_icon = "🌡️"
                 lines.append(f"{temp_icon} CPU温度: {temp_c:.1f}°C")
-            except Exception:
+            except Exception as e:
+                logger.debug("slash.hw.temp_read_failed", error=str(e))
                 lines.append("🌡️ CPU温度: 无法读取")
             try:
                 freq_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
                 with open(freq_path) as f:
                     freq_khz = int(f.read().strip())
                 lines.append(f"⚡ CPU频率: {freq_khz // 1000} MHz")
-            except Exception:
+            except Exception as e:
+                logger.debug("slash.hw.freq_read_failed", error=str(e))
                 lines.append("⚡ CPU频率: 无法读取")
             try:
                 with open("/proc/meminfo") as f:
@@ -321,7 +361,8 @@ class SlashCommandHandler:
                 if mem_pct > 90:
                     mem_icon = "💾⚠️"
                 lines.append(f"{mem_icon} 内存: {mem_used//1024}M / {mem_total//1024}M ({mem_pct:.0f}%)")
-            except Exception:
+            except Exception as e:
+                logger.debug("slash.hw.mem_read_failed", error=str(e))
                 lines.append("💾 内存: 无法读取")
             try:
                 stat = os.statvfs('/')
@@ -330,13 +371,15 @@ class SlashCommandHandler:
                 used = total - free
                 pct = used / total * 100 if total > 0 else 0
                 lines.append(f"💿 磁盘: {used//1073741824}G / {total//1073741824}G ({pct:.0f}%)")
-            except Exception:
+            except Exception as e:
+                logger.debug("slash.hw.disk_read_failed", error=str(e))
                 lines.append("💿 磁盘: 无法读取")
             try:
                 with open("/proc/loadavg") as f:
                     load = f.read().strip().split()[:3]
                 lines.append(f"📊 负载: {' '.join(load)}")
-            except Exception:
+            except Exception as e:
+                logger.debug("slash.hw.load_read_failed", error=str(e))
                 lines.append("📊 负载: 无法读取")
         except Exception:
             pass
@@ -359,12 +402,12 @@ class SlashCommandHandler:
             lines.append("✅ 错误监控: 未启用")
         try:
             import subprocess
-            result = subprocess.run(["systemctl", "is-active", "nahida-bot"], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(["systemctl", "is-active", "qq-agent"], capture_output=True, text=True, timeout=5)
             status = result.stdout.strip() or "未知"
             status_icon = "🟢" if status == "active" else "🔴"
-            lines.append(f"{status_icon} nahida-bot: {status}")
+            lines.append(f"{status_icon} qq-agent: {status}")
         except Exception:
-            lines.append("🔘 nahida-bot: 状态未知")
+            lines.append("🔘 qq-agent: 状态未知")
         if self._router:
             label = self._router.get_model_preference_label()
             from model_router import ROUTE_TABLE
@@ -373,6 +416,8 @@ class SlashCommandHandler:
         return "\n".join(lines)
 
     async def _cmd_cam(self, args: str, user_id: str) -> str:
+        if not self._is_owner(user_id):
+            return "只有主人才能使用摄像头哦~"
         try:
             from vision_service import VisionService
             vs = VisionService()
@@ -391,6 +436,124 @@ class SlashCommandHandler:
         except Exception as e:
             return f"📷 摄像头操作失败: {str(e)[:100]}"
 
+    async def _cmd_memory(self, args: str, user_id: str) -> str:
+        lines = ["🧠 记忆统计"]
+        if self._db:
+            try:
+                count = await self._db.memory.get_episodic_count()
+                lines.append(f"📋 情景记忆条数: {count}")
+            except Exception as e:
+                lines.append(f"📋 情景记忆: 读取失败 ({str(e)[:50]})")
+        else:
+            lines.append("📋 数据库未就绪")
+        if self._memory:
+            try:
+                last_encode = getattr(self._memory, '_last_encode_time', 0)
+                if last_encode > 0:
+                    import datetime
+                    dt = datetime.datetime.fromtimestamp(last_encode).strftime("%m/%d %H:%M")
+                    elapsed = time.time() - last_encode
+                    lines.append(f"⏰ 上次编码: {dt}（{int(elapsed // 60)}分钟前）")
+                else:
+                    lines.append("⏰ 上次编码: 尚未编码")
+            except Exception:
+                lines.append("⏰ 上次编码: 未知")
+        else:
+            lines.append("⏰ 记忆管理器未就绪")
+        return "\n".join(lines)
+
+    async def _cmd_emotion(self, args: str, user_id: str) -> str:
+        lines = ["💫 当前情绪状态"]
+        if self._context:
+            hint = getattr(self._context, 'emotion_hint', '')
+            if hint:
+                lines.append(f"🎭 情绪提示: {hint}")
+            else:
+                lines.append("🎭 情绪提示: 平静")
+        else:
+            lines.append("🎭 上下文未就绪")
+        if self._agent:
+            try:
+                from emotion_simple import detect_emotion
+                last_input = ""
+                if self._context and hasattr(self._context, 'history') and self._context.history:
+                    for msg in reversed(self._context.history):
+                        if msg.get("role") == "user":
+                            last_input = msg.get("content", "")
+                            break
+                if last_input:
+                    emotion = detect_emotion(last_input)
+                    primary = emotion.get("primary", "平静")
+                    intensity = emotion.get("intensity", 0)
+                    lines.append(f"😊 感知情绪: {primary}")
+                    lines.append(f"📊 情绪强度: {intensity:.1f}")
+                else:
+                    lines.append("😊 感知情绪: 暂无对话")
+            except Exception:
+                lines.append("😊 情绪检测: 不可用")
+        return "\n".join(lines)
+
+    async def _cmd_knowledge(self, args: str, user_id: str) -> str:
+        lines = ["🕸️ 知识图谱统计"]
+        if self._db:
+            try:
+                entity_count = await self._db.knowledge.get_entity_count()
+                lines.append(f"📌 实体数量: {entity_count}")
+            except Exception as e:
+                lines.append(f"📌 实体数量: 读取失败 ({str(e)[:50]})")
+            try:
+                relations = await self._db.knowledge.get_all_relations()
+                lines.append(f"🔗 关系数量: {len(relations)}")
+                if relations:
+                    recent = relations[:3]
+                    for r in recent:
+                        fr = r.get("from_entity", "?")
+                        rel = r.get("relation_type", "?")
+                        to = r.get("to_entity", "?")
+                        lines.append(f"  · {fr} —[{rel}]→ {to}")
+            except Exception as e:
+                lines.append(f"🔗 关系数量: 读取失败 ({str(e)[:50]})")
+        else:
+            lines.append("数据库未就绪")
+        return "\n".join(lines)
+
+    async def _cmd_debug(self, args: str, user_id: str) -> str:
+        lines = ["🔧 内部状态（调试）"]
+        # Metrics snapshot
+        try:
+            from metrics import metrics
+            snapshot = metrics.get_snapshot()
+            counters = snapshot.get("counters", {})
+            gauges = snapshot.get("gauges", {})
+            if counters:
+                lines.append("📊 计数器:")
+                for k, v in list(counters.items())[:10]:
+                    lines.append(f"  · {k}: {v}")
+            if gauges:
+                lines.append("📈 仪表:")
+                for k, v in list(gauges.items())[:10]:
+                    lines.append(f"  · {k}: {v:.3f}")
+            timer_keys = [k for k in snapshot if k.startswith("timer.")]
+            if timer_keys:
+                lines.append("⏱️ 计时器:")
+                for k in timer_keys[:5]:
+                    info = snapshot[k]
+                    lines.append(f"  · {k[6:]}: avg={info['avg']}s p95={info['p95']}s n={info['samples']}")
+        except Exception as e:
+            lines.append(f"📊 指标: 读取失败 ({str(e)[:50]})")
+        # Router state
+        if self._router:
+            pref = self._router.get_model_preference()
+            label = self._router.get_model_preference_label()
+            stats = self._router.get_cache_stats()
+            lines.append(f"🤖 路由: {label} (pref={pref})")
+            lines.append(f"   调用: {stats['total_calls']}次")
+        # Context state
+        if self._context:
+            hist_len = len(self._context.history) if hasattr(self._context, 'history') else 0
+            lines.append(f"💬 上下文历史: {hist_len}条")
+        return "\n".join(lines)
+
     async def _cmd_help(self, args: str, user_id: str) -> str:
         is_owner = self._security and self._security.is_owner(user_id)
 
@@ -405,14 +568,18 @@ class SlashCommandHandler:
             ("/hw", "查看香橙派硬件状态"),
             ("/cam", "拍照并分析摄像头画面（/cam snap仅拍照）"),
             ("/sys", "查看系统运行状态"),
+            ("/memory", "查看记忆统计"),
+            ("/emotion", "查看当前情绪状态"),
+            ("/knowledge", "查看知识图谱统计"),
             ("/help", "显示此帮助"),
         ]
 
         owner_cmds = [
-            ("/model [mimo|mimo-pro]", "切换模型模式"),
+            ("/model [mimo|mimo-pro|mimo-flash|mimo-mini]", "切换模型模式"),
             ("/reset", "重置对话上下文"),
             ("/voice [on|off]", "切换语音模式"),
             ("/agent [名称]", "切换对话目标Agent"),
+            ("/debug", "查看内部调试状态"),
         ]
 
         for cmd, desc in public_cmds:

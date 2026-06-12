@@ -95,10 +95,12 @@ class ToolCallRepair:
         cutoff = now - self.STORM_TTL
         self._recent_calls = [(n, a, t) for n, a, t in self._recent_calls if t > cutoff]
 
-        call_key = (tool_name, arguments)
+        # 规范化 JSON 参数，避免键顺序不同导致漏检
+        normalized_args = self._normalize_json(arguments)
+        call_key = (tool_name, normalized_args)
         recent_keys = [(n, a) for n, a, t in self._recent_calls[-self._storm_window:]]
         is_storm = call_key in recent_keys
-        self._recent_calls.append((tool_name, arguments, now))
+        self._recent_calls.append((tool_name, normalized_args, now))
 
         if len(self._recent_calls) > self._storm_window * 2:
             self._recent_calls = self._recent_calls[-self._storm_window * 2:]
@@ -112,3 +114,12 @@ class ToolCallRepair:
 
     def clear_storm_window(self):
         self._recent_calls.clear()
+
+    @staticmethod
+    def _normalize_json(arguments: str) -> str:
+        """规范化 JSON 字符串，统一键顺序以便比较"""
+        try:
+            parsed = json.loads(arguments)
+            return json.dumps(parsed, sort_keys=True, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            return arguments

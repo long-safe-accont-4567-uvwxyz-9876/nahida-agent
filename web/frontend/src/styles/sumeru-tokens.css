@@ -1,0 +1,31 @@
+:root {
+  /* Primary palette */
+  --dendro: #7fd650;
+  --dendro-dim: rgba(127, 214, 80, 0.6);
+  --forest: #1d3b2a;
+  --forest-deep: #0f1f17;
+  --wisdom: #e8d5a3;
+  --moon: #f2f7ee;
+  --moon-dim: rgba(242, 247, 238, 0.7);
+  --alert: #d96a5f;
+
+  /* Glass panel */
+  --glass-bg: rgba(20, 40, 28, 0.45);
+  --glass-border: rgba(127, 214, 80, 0.18);
+  --glass-blur: 14px;
+  --glass-radius: 16px;
+
+  /* Shadows */
+  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+  --shadow-glow: 0 0 20px rgba(127, 214, 80, 0.15);
+
+  /* Transitions */
+  --ease-out: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-smooth: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Spacing */
+  --sidebar-width: 64px;
+  --sidebar-expanded: 280px;
+  --topbar-height: 56px;
+}

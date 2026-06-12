@@ -1,20 +1,71 @@
+import asyncio
+import ipaddress
+import socket
 import time
+from typing import Any
 from urllib.parse import urlparse
-import ssl
 from loguru import logger
 from tool_registry import register_tool, ToolPermission, ToolResult
-
-_ssl_ctx = ssl.create_default_context()
-_ssl_ctx.check_hostname = False
-_ssl_ctx.verify_mode = ssl.CERT_NONE
+from sandbox_config import check_domain_allowed
 
 _CONTENT_LIMIT = 8000
+
+# 网页浏览缓存：5分钟TTL
+_browse_cache: dict[str, tuple[float, Any]] = {}
+_BROWSE_CACHE_TTL = 300.0  # 5分钟
+
+# 模块级 primp.Client 单例
+_primp_client = None
+
+
+def _get_primp_client():
+    global _primp_client
+    if _primp_client is None:
+        import primp
+        _primp_client = primp.Client(impersonate="chrome")
+    return _primp_client
+
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+]
+
+_PRIVATE_NETWORKS_V6 = [
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _is_private_ip(hostname: str) -> bool:
+    """检查 hostname 解析后的 IP 是否为内网/保留地址，防止 SSRF"""
+    try:
+        resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, type_, proto, canonname, sockaddr in resolved:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if isinstance(ip, ipaddress.IPv4Address):
+                for net in _PRIVATE_NETWORKS:
+                    if ip in net:
+                        logger.warning("web_browse.blocked_private_ip", hostname=hostname, ip=str(ip))
+                        return True
+            elif isinstance(ip, ipaddress.IPv6Address):
+                for net in _PRIVATE_NETWORKS_V6:
+                    if ip in net:
+                        logger.warning("web_browse.blocked_private_ip", hostname=hostname, ip=str(ip))
+                        return True
+    except socket.gaierror:
+        return True  # 无法解析的域名也拒绝
+    return False
 
 
 def _fetch_html(url: str, timeout: int = 15) -> tuple[int, str, str]:
     try:
-        import primp
-        client = primp.Client(impersonate="chrome")
+        client = _get_primp_client()
         resp = client.get(url, headers={
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         })
@@ -35,7 +86,7 @@ def _fetch_html(url: str, timeout: int = 15) -> tuple[int, str, str]:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as response:
+    with urllib.request.urlopen(req, timeout=timeout) as response:
         if response.status >= 400:
             return response.status, "", f"HTTP 错误: {response.status} {response.reason}"
         html = response.read().decode("utf-8", errors="ignore")
@@ -44,7 +95,11 @@ def _fetch_html(url: str, timeout: int = 15) -> tuple[int, str, str]:
 
 @register_tool(
     name="web_browse",
-    description="浏览网页并提取文本内容。输入URL地址。",
+    description=(
+        "打开网页 URL 读取正文全文。这是 web_search 的配套工具："
+        "搜索结果只有摘要，挑最相关的链接用本工具读全文后再回答，信息才准确完整。"
+        "适合读新闻、文章、文档、百科页面。"
+    ),
     schema={
         "type": "object",
         "properties": {
@@ -56,15 +111,32 @@ def _fetch_html(url: str, timeout: int = 15) -> tuple[int, str, str]:
     category="web",
     max_frequency=5,
 )
-def web_browse(url: str) -> ToolResult:
+async def web_browse(url: str) -> ToolResult:
     try:
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
-        status, html, error = _fetch_html(url)
+        # 沙箱域名检查
+        allowed, reason = check_domain_allowed(url)
+        if not allowed:
+            return ToolResult.fail(f"沙箱安全限制: {reason}")
+
+        # SSRF 防护：检查 hostname 是否解析到内网 IP
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if hostname and await asyncio.to_thread(_is_private_ip, hostname):
+            return ToolResult.fail(f"安全限制：禁止访问内网地址 {hostname}")
+
+        # 检查浏览缓存
+        now = time.monotonic()
+        cached = _browse_cache.get(url)
+        if cached is not None and (now - cached[0]) < _BROWSE_CACHE_TTL:
+            return cached[1]
+
+        status, html, error = await asyncio.to_thread(_fetch_html, url)
         if error:
-            time.sleep(2)
-            status, html, error = _fetch_html(url)
+            await asyncio.sleep(2)
+            status, html, error = await asyncio.to_thread(_fetch_html, url)
             if error:
                 return ToolResult.fail(f"浏览网页失败: {error}")
 
@@ -85,7 +157,12 @@ def web_browse(url: str) -> ToolResult:
         if len(text) > _CONTENT_LIMIT:
             text = text[:_CONTENT_LIMIT] + "\n...(内容过长已截断)"
 
-        return ToolResult.ok(header + text)
+        result = ToolResult.ok(header + text)
+
+        # 更新浏览缓存
+        _browse_cache[url] = (now, result)
+
+        return result
     except Exception as e:
         return ToolResult.fail(f"浏览网页失败: {str(e)}")
 

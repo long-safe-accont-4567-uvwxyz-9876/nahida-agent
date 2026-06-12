@@ -1,0 +1,314 @@
+"""内在世界路由（R9）：情绪/画像/今日事件/记忆/知识图谱/笔记/学习/本能。"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from loguru import logger
+
+from web.schemas import Envelope
+from web.routers.auth import get_current_user
+
+router = APIRouter(tags=["insight"], dependencies=[Depends(get_current_user)])
+
+
+def _today_start() -> float:
+    now = datetime.now()
+    return datetime(now.year, now.month, now.day).timestamp()
+
+
+# ── 情绪 ─────────────────────────────────────────────────────────
+
+
+@router.get("/insight/emotion/current", response_model=Envelope[dict])
+async def emotion_current(request: Request):
+    # 优先取网关缓存的最近一次回复情绪（ws_hub 写入）
+    cached = getattr(request.app.state, "last_emotion", None)
+    if cached:
+        return Envelope(data=cached)
+    core = request.app.state.core
+    row = await core.db.fetch_one(
+        "SELECT emotion_label, timestamp FROM conversation_logs "
+        "WHERE emotion_label != '' ORDER BY timestamp DESC LIMIT 1")
+    return Envelope(data={
+        "primary": (row or {}).get("emotion_label") or "中性",
+        "timestamp": (row or {}).get("timestamp", 0),
+    })
+
+
+@router.get("/insight/emotion/history", response_model=Envelope[list[dict]])
+async def emotion_history(request: Request, days: int = Query(default=7, ge=1, le=30)):
+    core = request.app.state.core
+    since = time.time() - days * 86400
+    rows = await core.db.fetch_all(
+        "SELECT strftime('%Y-%m-%d %H:00', timestamp, 'unixepoch', 'localtime') AS hour, "
+        "emotion_label, COUNT(*) AS cnt FROM conversation_logs "
+        "WHERE timestamp > ? AND emotion_label != '' "
+        "GROUP BY hour, emotion_label ORDER BY hour", (since,))
+    return Envelope(data=rows)
+
+
+# ── 用户画像 ─────────────────────────────────────────────────────
+
+
+@router.get("/insight/portrait", response_model=Envelope[dict])
+async def get_portrait(request: Request):
+    core = request.app.state.core
+    row = await core.db.fetch_one(
+        "SELECT * FROM user_portrait ORDER BY version DESC LIMIT 1")
+    history = await core.db.fetch_all(
+        "SELECT version, change_log, created_at FROM user_portrait "
+        "ORDER BY version DESC LIMIT 10")
+    return Envelope(data={"portrait": row or {}, "history": history})
+
+
+@router.post("/insight/portrait/consolidate", response_model=Envelope[dict])
+async def consolidate_portrait(request: Request):
+    core = request.app.state.core
+    if not core.portrait_manager:
+        raise HTTPException(503, "画像管理器未初始化")
+
+    async def _run():
+        try:
+            result = await core.portrait_manager.consolidate(force=True)
+            from web.ws_hub import manager
+            await manager.broadcast({"type": "portrait_consolidated",
+                                     "ok": bool(result)})
+        except Exception as e:
+            logger.warning("webui.portrait.consolidate_failed error={}", str(e))
+            try:
+                from web.ws_hub import manager
+                await manager.broadcast({"type": "portrait_consolidated",
+                                         "ok": False, "error": str(e)[:200]})
+            except Exception:
+                pass
+
+    asyncio.create_task(_run())
+    return Envelope(data={"started": True})
+
+
+# ── 今日事件 ─────────────────────────────────────────────────────
+
+
+@router.get("/insight/today", response_model=Envelope[dict])
+async def today(request: Request):
+    core = request.app.state.core
+    t0 = _today_start()
+    items: list[dict] = []
+    mems = await core.db.fetch_all(
+        "SELECT timestamp AS ts, summary AS text, importance, emotion_label "
+        "FROM episodic_memories WHERE timestamp >= ? ORDER BY timestamp", (t0,))
+    for m in mems:
+        items.append(dict(m, kind="memory"))
+    events = await core.db.fetch_all(
+        "SELECT created_at AS ts, event_type, detail AS text "
+        "FROM agent_events WHERE created_at >= ? ORDER BY created_at", (t0,))
+    for e in events:
+        items.append(dict(e, kind="event"))
+    notes = await core.db.fetch_all(
+        "SELECT created_at AS ts, kind AS note_kind, content AS text "
+        "FROM notebook_entries WHERE created_at >= ? ORDER BY created_at", (t0,))
+    for n in notes:
+        items.append(dict(n, kind="note"))
+    try:
+        greetings = await core.db.fetch_all(
+            "SELECT fired_at AS ts, content AS text, reason "
+            "FROM greeting_log WHERE fired_at >= ? ORDER BY fired_at", (t0,))
+        for g in greetings:
+            items.append(dict(g, kind="greeting"))
+    except Exception:
+        pass
+    items.sort(key=lambda x: x.get("ts") or 0)
+    conv = await core.db.fetch_one(
+        "SELECT COUNT(*) AS c FROM conversation_logs WHERE timestamp >= ?", (t0,))
+    tool_calls = await core.db.fetch_one(
+        "SELECT COUNT(*) AS c FROM audit_logs WHERE event_type LIKE 'tool%' AND timestamp >= ?", (t0,))
+    return Envelope(data={
+        "items": items,
+        "stats": {
+            "conversations": (conv or {}).get("c", 0),
+            "tool_calls": (tool_calls or {}).get("c", 0),
+            "memories": len(mems),
+        },
+    })
+
+
+# ── 记忆 ─────────────────────────────────────────────────────────
+
+
+@router.get("/insight/memories", response_model=Envelope[list[dict]])
+async def list_memories(request: Request,
+                        q: str = Query(default=""),
+                        importance_min: float = Query(default=0.0, ge=0, le=1),
+                        page: int = Query(default=0, ge=0),
+                        limit: int = Query(default=30, le=100)):
+    core = request.app.state.core
+    if q.strip() and core.memory:
+        try:
+            results = await core.memory.retrieve_memories(q.strip(), k=limit)
+            return Envelope(data=[
+                {"id": r.get("id"), "summary": r.get("summary", ""),
+                 "importance": r.get("importance", 0.5),
+                 "emotion_label": r.get("emotion_label", ""),
+                 "timestamp": r.get("timestamp", 0), "via": "vector"}
+                for r in results
+                if (r.get("importance") or 0) >= importance_min])
+        except Exception as e:
+            logger.warning("webui.memories.search_failed error={}", str(e))
+    rows = await core.db.fetch_all(
+        "SELECT id, timestamp, summary, importance, emotion_label "
+        "FROM episodic_memories WHERE importance >= ? "
+        "ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+        (importance_min, limit, page * limit))
+    return Envelope(data=[dict(r, via="db") for r in rows])
+
+
+@router.delete("/insight/memories/{memory_id}", response_model=Envelope[dict])
+async def delete_memory(memory_id: int, request: Request):
+    if request.headers.get("X-Confirm") != "yes":
+        raise HTTPException(400, "缺少 X-Confirm: yes 确认头")
+    core = request.app.state.core
+    vec = getattr(core, "_vec_store", None)
+    await core.db.memory.delete_memory_with_vector(memory_id, vector_store=vec)
+    await core.db.insert_audit_log("webui.memory.delete", "webui", str(memory_id))
+    await core.db.commit()
+    return Envelope(data={"deleted": memory_id})
+
+
+# ── 知识图谱 ─────────────────────────────────────────────────────
+
+
+@router.get("/insight/knowledge/graph", response_model=Envelope[dict])
+async def knowledge_graph(request: Request,
+                          entity: str = Query(default=""),
+                          depth: int = Query(default=1, ge=1, le=2)):
+    core = request.app.state.core
+    kdb = core.db.knowledge
+    nodes: dict[str, dict] = {}
+    edges: list[dict] = []
+
+    async def _node(name: str):
+        if name in nodes:
+            return
+        ent = await kdb.get_knowledge_entity(name)
+        nodes[name] = {"name": name, "kind": (ent or {}).get("kind", "")}
+
+    if entity.strip():
+        frontier = [entity.strip()]
+        seen_rel: set[str] = set()
+        for _ in range(depth):
+            next_frontier = []
+            for name in frontier:
+                await _node(name)
+                rels = await kdb.get_knowledge_relations(name)
+                for r in rels:
+                    rid = r.get("id", f"{r['from_entity']}-{r['to_entity']}")
+                    if rid in seen_rel:
+                        continue
+                    seen_rel.add(rid)
+                    await _node(r["from_entity"])
+                    await _node(r["to_entity"])
+                    edges.append({"from": r["from_entity"], "to": r["to_entity"],
+                                  "relation": r.get("relation_type", "")})
+                    for other in (r["from_entity"], r["to_entity"]):
+                        if other != name:
+                            next_frontier.append(other)
+            frontier = next_frontier
+    else:
+        rows = await core.db.fetch_all(
+            "SELECT * FROM knowledge_relations ORDER BY rowid DESC LIMIT 80")
+        for r in rows:
+            await _node(r["from_entity"])
+            await _node(r["to_entity"])
+            edges.append({"from": r["from_entity"], "to": r["to_entity"],
+                          "relation": r.get("relation_type", "")})
+    return Envelope(data={"nodes": list(nodes.values()), "edges": edges})
+
+
+# ── 笔记 ─────────────────────────────────────────────────────────
+
+
+@router.get("/insight/notebook", response_model=Envelope[list[dict]])
+async def list_notes(request: Request,
+                     kind: str = Query(default=""),
+                     limit: int = Query(default=50, le=200)):
+    core = request.app.state.core
+    cond, params = "status != 'archived'", []
+    if kind:
+        cond += " AND kind=?"
+        params.append(kind)
+    rows = await core.db.fetch_all(
+        f"SELECT * FROM notebook_entries WHERE {cond} "
+        f"ORDER BY importance DESC, updated_at DESC LIMIT ?",
+        tuple(params) + (limit,))
+    return Envelope(data=rows)
+
+
+@router.post("/insight/notebook", response_model=Envelope[dict])
+async def create_note(body: dict, request: Request):
+    core = request.app.state.core
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(400, "content 不能为空")
+    kind = body.get("kind", "note")
+    note_id = await core.db.notebook.insert_notebook(
+        kind=kind, content=content, tags=body.get("tags", ""),
+        importance=float(body.get("importance", 0.5)))
+    await core.db.commit()
+    return Envelope(data={"id": note_id, "kind": kind})
+
+
+@router.put("/insight/notebook/{note_id}", response_model=Envelope[dict])
+async def update_note(note_id: int, body: dict, request: Request):
+    core = request.app.state.core
+    sets, params = [], []
+    for field in ("content", "tags", "kind", "status"):
+        if field in body and body[field] is not None:
+            sets.append(f"{field}=?")
+            params.append(body[field])
+    if "importance" in body and body["importance"] is not None:
+        sets.append("importance=?")
+        params.append(float(body["importance"]))
+    if not sets:
+        raise HTTPException(400, "无可更新字段")
+    sets.append("updated_at=?")
+    params.append(time.time())
+    n = await core.db.execute(
+        f"UPDATE notebook_entries SET {', '.join(sets)} WHERE id=?",
+        tuple(params) + (note_id,))
+    if not n:
+        raise HTTPException(404, f"笔记 {note_id} 不存在")
+    return Envelope(data={"id": note_id, "updated": True})
+
+
+@router.delete("/insight/notebook/{note_id}", response_model=Envelope[dict])
+async def delete_note(note_id: int, request: Request):
+    core = request.app.state.core
+    await core.db.notebook.delete_notebook_entry(note_id)
+    await core.db.commit()
+    return Envelope(data={"deleted": note_id})
+
+
+# ── 学习与本能 ───────────────────────────────────────────────────
+
+
+@router.get("/insight/learnings", response_model=Envelope[list[dict]])
+async def list_learnings(request: Request, limit: int = Query(default=50, le=200)):
+    core = request.app.state.core
+    rows = await core.db.fetch_all(
+        "SELECT * FROM learnings ORDER BY last_seen DESC LIMIT ?", (limit,))
+    return Envelope(data=rows)
+
+
+@router.get("/insight/instincts", response_model=Envelope[list[dict]])
+async def list_instincts(request: Request, limit: int = Query(default=50, le=200)):
+    core = request.app.state.core
+    try:
+        rows = await core.db.fetch_all(
+            "SELECT * FROM instincts ORDER BY confidence DESC LIMIT ?", (limit,))
+    except Exception:
+        rows = []
+    return Envelope(data=rows)

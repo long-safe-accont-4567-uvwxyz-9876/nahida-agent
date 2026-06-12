@@ -1,10 +1,29 @@
-import subprocess
+import asyncio
 import os
 from tool_registry import register_tool, ToolPermission, ToolResult
 
 
 PROTECTED_SERVICES = {"sshd", "systemd", "systemd-journald", "systemd-logind", "systemd-udevd", "dbus", "cron", "rsyslog", "networking", "NetworkManager", "ufw"}
-AGENT_SERVICES = {"nahida-bot", "napcat", "qqbot", "nginx", "frpc", "docker"}
+AGENT_SERVICES = {"qq-agent", "napcat", "qqbot", "nginx", "frpc", "docker"}
+
+
+async def _run_cmd(args: list[str], timeout: int = 30, cwd: str | None = None) -> tuple[int, str, str]:
+    """异步执行命令，返回 (returncode, stdout, stderr)"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
 
 
 @register_tool(
@@ -24,21 +43,18 @@ AGENT_SERVICES = {"nahida-bot", "napcat", "qqbot", "nginx", "frpc", "docker"}
     max_frequency=10,
     requires_confirmation=True,
 )
-def service_manage(action: str, name: str = "", lines: int = 30) -> ToolResult:
+async def service_manage(action: str, name: str = "", lines: int = 30) -> ToolResult:
     try:
         if action == "status":
             if not name:
                 return ToolResult.fail("请指定服务名称")
-            result = subprocess.run(
-                ["systemctl", "status", name, "--no-pager"],
-                capture_output=True, text=True, timeout=30
-            )
-            output = result.stdout or result.stderr
-            if result.returncode == 0:
+            rc, stdout, stderr = await _run_cmd(["systemctl", "status", name, "--no-pager"], timeout=30)
+            output = stdout or stderr
+            if rc == 0:
                 return ToolResult.ok(f"服务 {name} 状态:\n{output.strip()}")
-            elif result.returncode == 3:
+            elif rc == 3:
                 return ToolResult.ok(f"服务 {name} 状态:\n{output.strip()}")
-            elif result.returncode == 4:
+            elif rc == 4:
                 return ToolResult.fail(f"服务 {name} 不存在")
             return ToolResult.ok(f"服务 {name} 状态:\n{output.strip()}")
 
@@ -47,37 +63,22 @@ def service_manage(action: str, name: str = "", lines: int = 30) -> ToolResult:
                 return ToolResult.fail("请指定服务名称")
             if name in PROTECTED_SERVICES:
                 return ToolResult.fail(f"服务 {name} 是受保护的核心服务，不允许重启")
-            result = subprocess.run(
-                ["systemctl", "restart", name],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                status_result = subprocess.run(
-                    ["systemctl", "is-active", name],
-                    capture_output=True, text=True, timeout=10
-                )
-                return ToolResult.ok(f"服务 {name} 已重启，当前状态: {status_result.stdout.strip()}")
-            return ToolResult.fail(f"重启服务 {name} 失败: {result.stderr.strip()}")
+            rc, stdout, stderr = await _run_cmd(["systemctl", "restart", name], timeout=30)
+            if rc == 0:
+                _, status_out, _ = await _run_cmd(["systemctl", "is-active", name], timeout=10)
+                return ToolResult.ok(f"服务 {name} 已重启，当前状态: {status_out.strip()}")
+            return ToolResult.fail(f"重启服务 {name} 失败: {stderr.strip()}")
 
         elif action == "list":
             results = []
             for svc in sorted(AGENT_SERVICES):
-                check = subprocess.run(
-                    ["systemctl", "list-unit-files", f"{svc}.service"],
-                    capture_output=True, text=True, timeout=10
-                )
-                if f"{svc}.service" not in check.stdout:
+                rc, check_out, _ = await _run_cmd(["systemctl", "list-unit-files", f"{svc}.service"], timeout=10)
+                if f"{svc}.service" not in check_out:
                     continue
-                status = subprocess.run(
-                    ["systemctl", "is-active", svc],
-                    capture_output=True, text=True, timeout=10
-                )
-                enable = subprocess.run(
-                    ["systemctl", "is-enabled", svc],
-                    capture_output=True, text=True, timeout=10
-                )
-                active = status.stdout.strip()
-                enabled = enable.stdout.strip()
+                _, status_out, _ = await _run_cmd(["systemctl", "is-active", svc], timeout=10)
+                _, enable_out, _ = await _run_cmd(["systemctl", "is-enabled", svc], timeout=10)
+                active = status_out.strip()
+                enabled = enable_out.strip()
                 icon = "🟢" if active == "active" else "🔴" if active == "inactive" else "🟡"
                 results.append(f"{icon} {svc}: 运行状态={active}, 开机启动={enabled}")
             if not results:
@@ -87,18 +88,15 @@ def service_manage(action: str, name: str = "", lines: int = 30) -> ToolResult:
         elif action == "logs":
             if not name:
                 return ToolResult.fail("请指定服务名称")
-            result = subprocess.run(
-                ["journalctl", "-u", name, "-n", str(lines), "--no-pager"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode != 0:
-                return ToolResult.fail(f"获取服务 {name} 日志失败: {result.stderr.strip()}")
-            return ToolResult.ok(f"服务 {name} 最近 {lines} 条日志:\n{result.stdout.strip()}")
+            rc, stdout, stderr = await _run_cmd(["journalctl", "-u", name, "-n", str(lines), "--no-pager"], timeout=30)
+            if rc != 0:
+                return ToolResult.fail(f"获取服务 {name} 日志失败: {stderr.strip()}")
+            return ToolResult.ok(f"服务 {name} 最近 {lines} 条日志:\n{stdout.strip()}")
 
         else:
             return ToolResult.fail(f"不支持的操作: {action}")
 
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         return ToolResult.fail(f"操作超时: {action}")
     except Exception as e:
         return ToolResult.fail(f"服务管理错误: {str(e)}")
@@ -120,17 +118,14 @@ def service_manage(action: str, name: str = "", lines: int = 30) -> ToolResult:
     category="system",
     max_frequency=15,
 )
-def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolResult:
+async def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolResult:
     try:
         if action == "interfaces":
-            result = subprocess.run(
-                ["ip", "-j", "addr"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0 and result.stdout.strip():
+            rc, stdout, stderr = await _run_cmd(["ip", "-j", "addr"], timeout=30)
+            if rc == 0 and stdout.strip():
                 import json
                 try:
-                    interfaces = json.loads(result.stdout)
+                    interfaces = json.loads(stdout)
                     lines = []
                     for iface in interfaces:
                         name = iface.get("ifname", "未知")
@@ -149,38 +144,26 @@ def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolRe
                     return ToolResult.ok("网络接口信息:\n" + "\n".join(lines))
                 except json.JSONDecodeError:
                     pass
-            result = subprocess.run(
-                ["ip", "addr"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                return ToolResult.ok(f"网络接口信息:\n{result.stdout.strip()}")
+            rc, stdout, stderr = await _run_cmd(["ip", "addr"], timeout=30)
+            if rc == 0:
+                return ToolResult.ok(f"网络接口信息:\n{stdout.strip()}")
             return ToolResult.fail("获取网络接口信息失败")
 
         elif action == "ping":
-            result = subprocess.run(
-                ["ping", "-c", str(count), "-W", "3", target],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0:
-                lines = result.stdout.strip().split("\n")
+            rc, stdout, stderr = await _run_cmd(["ping", "-c", str(count), "-W", "3", target], timeout=30)
+            if rc == 0:
+                lines = stdout.strip().split("\n")
                 summary = lines[-2] if len(lines) >= 2 else ""
                 stats = lines[-1] if len(lines) >= 1 else ""
                 return ToolResult.ok(f"Ping {target} 结果:\n{summary}\n{stats}")
             return ToolResult.fail(f"Ping {target} 失败，目标不可达")
 
         elif action == "ports":
-            result = subprocess.run(
-                ["ss", "-tlnp"],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode != 0:
-                result = subprocess.run(
-                    ["netstat", "-tlnp"],
-                    capture_output=True, text=True, timeout=30
-                )
-            if result.returncode == 0:
-                lines = result.stdout.strip().split("\n")
+            rc, stdout, stderr = await _run_cmd(["ss", "-tlnp"], timeout=30)
+            if rc != 0:
+                rc, stdout, stderr = await _run_cmd(["netstat", "-tlnp"], timeout=30)
+            if rc == 0:
+                lines = stdout.strip().split("\n")
                 output_lines = [lines[0]] if lines else []
                 for line in lines[1:]:
                     if "LISTEN" in line or "Local" in line:
@@ -189,24 +172,18 @@ def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolRe
             return ToolResult.fail("获取监听端口信息失败")
 
         elif action == "dns":
-            result = subprocess.run(
-                ["nslookup", target],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return ToolResult.ok(f"DNS解析 {target}:\n{result.stdout.strip()}")
-            result = subprocess.run(
-                ["dig", "+short", target],
-                capture_output=True, text=True, timeout=30
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return ToolResult.ok(f"DNS解析 {target}:\n{result.stdout.strip()}")
+            rc, stdout, stderr = await _run_cmd(["nslookup", target], timeout=30)
+            if rc == 0 and stdout.strip():
+                return ToolResult.ok(f"DNS解析 {target}:\n{stdout.strip()}")
+            rc, stdout, stderr = await _run_cmd(["dig", "+short", target], timeout=30)
+            if rc == 0 and stdout.strip():
+                return ToolResult.ok(f"DNS解析 {target}:\n{stdout.strip()}")
             return ToolResult.fail(f"DNS解析 {target} 失败")
 
         else:
             return ToolResult.fail(f"不支持的操作: {action}")
 
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         return ToolResult.fail(f"操作超时: {action}")
     except Exception as e:
         return ToolResult.fail(f"网络诊断错误: {str(e)}")
@@ -214,7 +191,7 @@ def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolRe
 
 @register_tool(
     name="dev_assist",
-    description="开发辅助工具。支持查看Git状态(git_status)、检查Python依赖(pip_check)、查看Agent日志(logs)、查看项目结构(project_tree)。",
+    description="开发辅助工具。仅在用户明确要求开发调试相关操作时使用。支持查看Git状态(git_status)、检查Python依赖(pip_check)、查看Agent日志(logs)、查看项目结构(project_tree)。",
     schema={
         "type": "object",
         "properties": {
@@ -229,49 +206,36 @@ def network_diag(action: str, target: str = "8.8.8.8", count: int = 3) -> ToolRe
     category="system",
     max_frequency=15,
 )
-def dev_assist(action: str, path: str = "/home/orangepi/ai-agent", lines: int = 50, service: str = "nahida") -> ToolResult:
+async def dev_assist(action: str, path: str = "/home/orangepi/ai-agent", lines: int = 50, service: str = "nahida") -> ToolResult:
     try:
         if action == "git_status":
             if not os.path.isdir(os.path.join(path, ".git")):
                 return ToolResult.fail(f"{path} 不是Git仓库")
-            status_result = subprocess.run(
-                ["git", "status", "--short"],
-                capture_output=True, text=True, timeout=30, cwd=path
-            )
-            log_result = subprocess.run(
-                ["git", "log", "--oneline", "-5"],
-                capture_output=True, text=True, timeout=30, cwd=path
-            )
+            _, status_out, _ = await _run_cmd(["git", "status", "--short"], timeout=30, cwd=path)
+            _, log_out, _ = await _run_cmd(["git", "log", "--oneline", "-5"], timeout=30, cwd=path)
             parts = []
-            if status_result.stdout.strip():
-                parts.append(f"文件变更:\n{status_result.stdout.strip()}")
+            if status_out.strip():
+                parts.append(f"文件变更:\n{status_out.strip()}")
             else:
                 parts.append("工作区干净，无未提交的变更")
-            if log_result.stdout.strip():
-                parts.append(f"最近提交:\n{log_result.stdout.strip()}")
+            if log_out.strip():
+                parts.append(f"最近提交:\n{log_out.strip()}")
             return ToolResult.ok(f"Git仓库状态 ({path}):\n" + "\n\n".join(parts))
 
         elif action == "pip_check":
-            check_result = subprocess.run(
-                ["pip", "check"],
-                capture_output=True, text=True, timeout=30
-            )
+            _, check_out, _ = await _run_cmd(["pip", "check"], timeout=30)
+            _, list_out, _ = await _run_cmd(["pip", "list", "--format=columns"], timeout=30)
             key_packages = ["openai", "aiosqlite", "loguru", "qq-botpy", "aiohttp", "fastapi", "uvicorn", "pydantic", "httpx"]
-            pip_list = subprocess.run(
-                ["pip", "list", "--format=columns"],
-                capture_output=True, text=True, timeout=30
-            )
             parts = []
-            if check_result.stdout.strip():
-                parts.append(f"依赖检查:\n{check_result.stdout.strip()}")
+            if check_out.strip():
+                parts.append(f"依赖检查:\n{check_out.strip()}")
             else:
                 parts.append("依赖检查: 无冲突")
             installed = {}
-            if pip_list.returncode == 0:
-                for line in pip_list.stdout.strip().split("\n")[2:]:
-                    cols = line.split()
-                    if len(cols) >= 2:
-                        installed[cols[0].lower()] = cols[1]
+            for line in list_out.strip().split("\n")[2:]:
+                cols = line.split()
+                if len(cols) >= 2:
+                    installed[cols[0].lower()] = cols[1]
             pkg_lines = []
             for pkg in key_packages:
                 ver = installed.get(pkg.lower())
@@ -291,12 +255,9 @@ def dev_assist(action: str, path: str = "/home/orangepi/ai-agent", lines: int = 
                     reverse=True
                 )
                 if not log_files:
-                    log_result = subprocess.run(
-                        ["journalctl", "-u", service, "-n", str(lines), "--no-pager"],
-                        capture_output=True, text=True, timeout=30
-                    )
-                    if log_result.returncode == 0 and log_result.stdout.strip():
-                        return ToolResult.ok(f"服务 {service} 最近 {lines} 条日志:\n{log_result.stdout.strip()}")
+                    rc, log_out, _ = await _run_cmd(["journalctl", "-u", service, "-n", str(lines), "--no-pager"], timeout=30)
+                    if rc == 0 and log_out.strip():
+                        return ToolResult.ok(f"服务 {service} 最近 {lines} 条日志:\n{log_out.strip()}")
                     return ToolResult.fail("未找到日志文件")
                 log_path = os.path.join(log_dir, log_files[0])
                 try:
@@ -307,33 +268,30 @@ def dev_assist(action: str, path: str = "/home/orangepi/ai-agent", lines: int = 
                 except Exception as e:
                     return ToolResult.fail(f"读取日志文件失败: {str(e)}")
             else:
-                log_result = subprocess.run(
-                    ["journalctl", "-u", service, "-n", str(lines), "--no-pager"],
-                    capture_output=True, text=True, timeout=30
-                )
-                if log_result.returncode == 0 and log_result.stdout.strip():
-                    return ToolResult.ok(f"服务 {service} 最近 {lines} 条日志:\n{log_result.stdout.strip()}")
+                rc, log_out, _ = await _run_cmd(["journalctl", "-u", service, "-n", str(lines), "--no-pager"], timeout=30)
+                if rc == 0 and log_out.strip():
+                    return ToolResult.ok(f"服务 {service} 最近 {lines} 条日志:\n{log_out.strip()}")
                 return ToolResult.fail("未找到日志目录或日志")
 
         elif action == "project_tree":
             if not os.path.isdir(path):
                 return ToolResult.fail(f"路径不存在: {path}")
-            result = subprocess.run(
+            rc, stdout, stderr = await _run_cmd(
                 ["find", path, "-maxdepth", "2",
                  "-not", "-path", "*/__pycache__/*",
                  "-not", "-path", "*/.git/*",
                  "-not", "-name", "*.pyc"],
-                capture_output=True, text=True, timeout=30
+                timeout=30,
             )
-            if result.returncode == 0:
-                output_lines = result.stdout.strip().split("\n")[:50]
+            if rc == 0:
+                output_lines = stdout.strip().split("\n")[:50]
                 return ToolResult.ok(f"项目结构 ({path}):\n" + "\n".join(output_lines))
             return ToolResult.fail("获取项目结构失败")
 
         else:
             return ToolResult.fail(f"不支持的操作: {action}")
 
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         return ToolResult.fail(f"操作超时: {action}")
     except Exception as e:
         return ToolResult.fail(f"开发辅助错误: {str(e)}")

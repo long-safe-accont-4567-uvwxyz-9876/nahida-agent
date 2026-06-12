@@ -16,5 +16,11 @@ def get_all_tools():
     import tools.document_tools
     import tools.web_browse_tools
     import tools.multi_search_tools
-    from tool_registry import _tools
-    return [_ToolProxy(t) for t in _tools.values()]
+    import tools.agnes_tools
+    import tools.hardware_tools
+    import tools.system_tools
+    import tools.vision_tools
+    import tools.memory_tool
+    import tools.nudge_tool
+    from tool_registry import get_all_tool_dicts
+    return [_ToolProxy(t) for t in get_all_tool_dicts().values()]

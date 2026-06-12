@@ -9,8 +9,12 @@ class NotebookDB:
         self._conn = conn
         conn.row_factory = aiosqlite.Row
 
+    async def commit(self):
+        await self._conn.commit()
+
     async def insert_notebook(self, kind: str, content: str, tags: str = "",
-                               importance: float = 0.5, due_date: float = 0) -> int:
+                               importance: float = 0.5, due_date: float = 0,
+                               auto_commit: bool = True) -> int:
         now = time.time()
         cursor = await self._conn.execute(
             """INSERT INTO notebook_entries
@@ -18,7 +22,8 @@ class NotebookDB:
                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)""",
             (kind, content, tags, importance, due_date, now, now),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.lastrowid
 
     async def get_notebook_notes(self, kind: str | None = None, limit: int = 10) -> list[dict]:
@@ -39,7 +44,8 @@ class NotebookDB:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def archive_notebook_entries(self, id_threshold: int = 0, kind: str | None = None):
+    async def archive_notebook_entries(self, id_threshold: int = 0, kind: str | None = None,
+                                        auto_commit: bool = True):
         if kind:
             await self._conn.execute(
                 """UPDATE notebook_entries SET status='archived', updated_at=?
@@ -52,22 +58,25 @@ class NotebookDB:
                    WHERE status='active' AND id > ?""",
                 (time.time(), id_threshold),
             )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
 
-    async def delete_notebook_entry(self, note_id: int) -> bool:
+    async def delete_notebook_entry(self, note_id: int, auto_commit: bool = True) -> bool:
         cursor = await self._conn.execute(
             "UPDATE notebook_entries SET status='archived', updated_at=? WHERE id=?",
             (time.time(), note_id),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.rowcount > 0
 
-    async def touch_notebook_entry(self, note_id: int) -> bool:
+    async def touch_notebook_entry(self, note_id: int, auto_commit: bool = True) -> bool:
         cursor = await self._conn.execute(
             "UPDATE notebook_entries SET updated_at=? WHERE id=?",
             (time.time(), note_id),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.rowcount > 0
 
     async def get_due_tasks(self, window_seconds: int = 3600) -> list[dict]:
@@ -92,16 +101,26 @@ class NotebookDB:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def complete_task(self, task_id: int):
+    async def complete_task(self, task_id: int, auto_commit: bool = True):
         await self._conn.execute(
             "UPDATE notebook_entries SET status='completed', updated_at=? WHERE id=?",
             (time.time(), task_id),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
 
-    async def cancel_task(self, task_id: int):
+    async def remind_task(self, task_id: int, auto_commit: bool = True):
+        await self._conn.execute(
+            "UPDATE notebook_entries SET status='reminded', updated_at=? WHERE id=?",
+            (time.time(), task_id),
+        )
+        if auto_commit:
+            await self._conn.commit()
+
+    async def cancel_task(self, task_id: int, auto_commit: bool = True):
         await self._conn.execute(
             "UPDATE notebook_entries SET status='cancelled', updated_at=? WHERE id=?",
             (time.time(), task_id),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()

@@ -1,4 +1,6 @@
 import os
+import re
+import time
 import asyncio
 import json
 from dataclasses import dataclass, field
@@ -8,6 +10,65 @@ from openai import AsyncOpenAI
 from loguru import logger
 from agent_dispatcher import AgentDispatcher
 from emoji_config import get_status_msg
+from config import AGENT_ROUTE_KEYWORDS, DATA_DIR
+from belief_router import BeliefRouter
+
+
+class RouteCache:
+    """LRU cache for routing decisions with TTL."""
+
+    def __init__(self, max_size: int = 200, ttl_seconds: float = 300.0):
+        self._cache: dict[str, tuple[list[str], float]] = {}  # key -> (targets, timestamp)
+        self._max_size = max_size
+        self._ttl = ttl_seconds
+        self._access_order: list[str] = []  # for LRU eviction
+
+    def get(self, user_input: str) -> list[str] | None:
+        """Get cached route result. Returns None if not found or expired."""
+        key = self._make_key(user_input)
+        if key not in self._cache:
+            return None
+        targets, ts = self._cache[key]
+        if time.time() - ts > self._ttl:
+            del self._cache[key]
+            self._access_order.remove(key)
+            return None
+        # Move to end (most recently used)
+        self._access_order.remove(key)
+        self._access_order.append(key)
+        return targets
+
+    def put(self, user_input: str, targets: list[str]):
+        """Cache a routing result."""
+        key = self._make_key(user_input)
+        if key in self._cache:
+            self._access_order.remove(key)
+        self._cache[key] = (targets, time.time())
+        self._access_order.append(key)
+        # Evict oldest if over max size
+        while len(self._cache) > self._max_size:
+            oldest = self._access_order.pop(0)
+            self._cache.pop(oldest, None)
+
+    def invalidate(self):
+        """Clear all cached entries."""
+        self._cache.clear()
+        self._access_order.clear()
+
+    def invalidate_agent(self, agent_name: str):
+        """Invalidate all cache entries that involve a specific agent."""
+        keys_to_remove = [
+            k for k, (targets, _) in self._cache.items()
+            if agent_name in targets
+        ]
+        for k in keys_to_remove:
+            del self._cache[k]
+            self._access_order.remove(k)
+
+    @staticmethod
+    def _make_key(user_input: str) -> str:
+        """Create a cache key from user input. Normalize whitespace and lowercase."""
+        return " ".join(user_input.lower().split())
 
 
 @dataclass
@@ -27,6 +88,7 @@ class TaskState:
     status_callback: Any = None
     _dispatcher: Any = None
     _agent_configs: dict = field(default_factory=dict)
+    skip_synthesis: bool = False
 
     def update(self, updates: dict) -> "TaskState":
         for k, v in updates.items():
@@ -79,9 +141,26 @@ class TaskGraph:
         state = initial_state
         current = self._entry_point
         max_steps = 15
+        max_node_visits = 2  # 同一节点访问超过此次数判环
+        node_visit_count: dict[str, int] = {}
+        global_deadline = time.monotonic() + 150  # 全局 150s 超时
+        node_timeout = 30  # 单节点 30s 超时
 
         for step in range(max_steps):
             if current == END:
+                break
+
+            # 全局超时检查
+            if time.monotonic() > global_deadline:
+                logger.warning("task_graph.global_timeout", step=step)
+                state.final_output = state.final_output or "任务执行超时"
+                break
+
+            # 环检测：同一节点访问次数超过阈值
+            node_visit_count[current] = node_visit_count.get(current, 0) + 1
+            if node_visit_count[current] > max_node_visits:
+                logger.warning("task_graph.cycle_detected", node=current, visits=node_visit_count[current])
+                state.final_output = state.final_output or f"检测到循环依赖，节点 {current} 被重复访问"
                 break
 
             handler = self._nodes.get(current)
@@ -93,9 +172,13 @@ class TaskGraph:
             logger.info("task_graph.executing", node=current, step=step)
 
             try:
-                updates = await handler(state)
+                updates = await asyncio.wait_for(handler(state), timeout=node_timeout)
                 if updates:
                     state.update(updates)
+            except asyncio.TimeoutError:
+                logger.warning("task_graph.node_timeout", node=current, timeout=node_timeout)
+                state.final_output = f"节点 {current} 执行超时（{node_timeout}s）"
+                break
             except Exception as e:
                 logger.error("task_graph.node_error", node=current, error=str(e))
                 state.final_output = f"任务执行出错: {e}"
@@ -120,30 +203,27 @@ class TaskGraph:
 
 
 class RouterNode:
+    _route_cache = RouteCache()  # class-level shared cache
+
     @staticmethod
     def _rule_route(user_input: str) -> list[str]:
         q = user_input.lower()
-        search_kw = ["搜索", "搜一下", "查一下", "找一下", "帮我查", "帮我搜", "搜索一下",
-                     "查资料", "最新", "新闻", "资讯", "获取网上", "看看有没有"]
-        code_kw = ["代码", "编程", "写代码", "debug", "调试", "程序", "开发", "部署",
-                   "git", "api", "接口", "函数", "脚本", "运行", "执行命令",
-                   "巡检", "检查系统", "磁盘", "内存", "cpu", "进程", "服务状态",
-                   "日志", "监控", "系统信息", "香橙派", "orange pi", "服务器",
-                   "docker", "容器", "网络", "端口", "防火墙", "配置文件",
-                   "gpio", "i2c", "spi", "传感器", "led", "舵机", "硬件", "引脚",
-                   "串口", "uart", "pwm", "adc", "dac",
-                   "摄像头", "拍照", "看看", "观察", "识别", "检测",
-                   "重启服务", "部署", "服务状态", "系统服务",
-                   "重启", "服务",
-                   ]
-        research_kw = ["研究", "分析", "学术", "论文", "深度", "计算复杂度", "数学证明",
-                       "物理", "化学", "生物", "统计", "推导", "公式"]
-        parallel_trigger_kw = [
-            "全面", "整体", "综合", "各个方面", "多方面", "同时",
-            "全部", "一起", "都检查", "都搜一下", "分别",
-            "全方位", "彻底", "完整", "所有", "各个板块",
-            "巡检", "体检", "诊断", "健康检查", "状况报告",
-        ]
+        search_kw = AGENT_ROUTE_KEYWORDS["xilian"]
+        code_kw = AGENT_ROUTE_KEYWORDS["yinlang"]
+        research_kw = AGENT_ROUTE_KEYWORDS["nike"]
+        parallel_trigger_kw = AGENT_ROUTE_KEYWORDS["parallel_trigger"]
+        nahida_only_patterns = AGENT_ROUTE_KEYWORDS["nahida"]
+
+        # 否定上下文检测：用户明确说不要做某事时，不应路由到对应Agent
+        is_negative = bool(re.search(
+            r"(?:不|别|不要|不用|不需要|没必要)\s*(?:要|用|调用|查|检查|执行|运行|搜索|搜|找|看)",
+            user_input
+        )) or bool(re.search(
+            r"(?:不需要|不用|别)\s*(?:调用|使用)\s*(?:这个|那个|任何)?\s*(?:工具|功能)",
+            user_input
+        ))
+        if is_negative:
+            return ["nahida"]
 
         matched = []
         if any(kw in q for kw in search_kw):
@@ -153,12 +233,6 @@ class RouterNode:
         if any(kw in q for kw in research_kw):
             matched.append("nike")
 
-        nahida_only_patterns = [
-            "天气", "气温", "温度", "下雨", "晴天", "阴天",
-            "时间", "几点", "现在几点", "日期", "今天星期几",
-            "翻译", "意思是什么",
-            "语音", "声音", "说话", "朗读", "念给我", "读给我", "听你", "听听", "发语音", "生成语音", "语音回复", "说给我听", "念出来", "tts", "voice",
-        ]
         if any(kw in q for kw in nahida_only_patterns):
             return ["nahida"]
 
@@ -170,9 +244,10 @@ class RouterNode:
             return matched
         return ["nahida"]
 
-    def __init__(self, client: AsyncOpenAI, model: str = "mimo-v2.5"):
+    def __init__(self, client: AsyncOpenAI, model: str = "mimo-v2.5", belief_router: BeliefRouter | None = None):
         self._client = client
         self._model = model
+        self._belief_router = belief_router
 
     def _build_route_prompt(self, user_input: str, agent_configs: dict) -> str:
         agent_list = []
@@ -210,11 +285,23 @@ class RouterNode:
         if not agent_configs:
             return {"route_targets": ["nahida"], "route_target": "nahida", "route_plan": ["nahida"]}
 
+        # Check route cache first
+        cached = self._route_cache.get(user_input)
+        if cached is not None:
+            logger.debug("route.cache_hit", input=user_input[:50], targets=cached)
+            return {
+                "route_targets": cached,
+                "route_target": cached[0] if len(cached) == 1 else "",
+                "route_plan": cached,
+            }
+
         rule_result = self._rule_route(user_input)
         if rule_result:
             targets = [t for t in rule_result if t in agent_configs or t == "nahida"]
             if not targets:
                 targets = ["nahida"]
+            # Cache the routing result
+            self._route_cache.put(user_input, targets)
             display_names = []
             for t in targets:
                 if t in agent_configs:
@@ -231,45 +318,88 @@ class RouterNode:
                 "route_plan": targets,
             }
 
-        prompt = self._build_route_prompt(user_input, agent_configs)
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=30,
-            temperature=0.1,
-        )
-        msg = response.choices[0].message
-        raw_result = msg.content.strip() if msg.content else ""
+        # Thompson Sampling belief routing (replaces LLM routing as primary fallback)
+        if self._belief_router:
+            selected = self._belief_router.select_agent(exclude={"nahida"})
+            targets = [selected]
+        else:
+            # LLM routing fallback (only if belief_router is not available)
+            prompt = self._build_route_prompt(user_input, agent_configs)
+            response = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=30,
+                temperature=0.1,
+            )
+            msg = response.choices[0].message
+            raw_result = msg.content.strip() if msg.content else ""
 
-        if not raw_result:
-            rc = getattr(msg, "reasoning_content", None) or ""
-            raw_result = rc[:50] if rc else ""
+            if not raw_result:
+                rc = getattr(msg, "reasoning_content", None) or ""
+                raw_result = rc[:50] if rc else ""
 
-        name_map = {}
-        for n, cfg in agent_configs.items():
-            name_map[n] = n
-            name_map[cfg.get("display_name", "")] = n
-        name_map["nahida"] = "nahida"
-        name_map["纳西妲"] = "nahida"
+            name_map = {}
+            for n, cfg in agent_configs.items():
+                name_map[n] = n
+                name_map[cfg.get("display_name", "")] = n
+            name_map["nahida"] = "nahida"
+            name_map["纳西妲"] = "nahida"
 
-        targets = []
-        seen = set()
-        for part in raw_result.replace("，", ",").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            matched = name_map.get(part)
-            if not matched:
-                for key, val in name_map.items():
-                    if key and key in part and val not in seen:
-                        matched = val
-                        break
-            if matched and matched not in seen:
-                targets.append(matched)
-                seen.add(matched)
+            targets = []
+            seen = set()
+            for part in raw_result.replace("，", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                matched = name_map.get(part)
+                if not matched:
+                    for key, val in name_map.items():
+                        if key and key in part and val not in seen:
+                            matched = val
+                            break
+                if matched and matched not in seen:
+                    targets.append(matched)
+                    seen.add(matched)
 
-        if not targets:
-            targets = ["nahida"]
+            if not targets:
+                targets = ["nahida"]
+
+        # # Original LLM routing (kept as reference):
+        # prompt = self._build_route_prompt(user_input, agent_configs)
+        # response = await self._client.chat.completions.create(
+        #     model=self._model,
+        #     messages=[{"role": "user", "content": prompt}],
+        #     max_tokens=30,
+        #     temperature=0.1,
+        # )
+        # msg = response.choices[0].message
+        # raw_result = msg.content.strip() if msg.content else ""
+        # if not raw_result:
+        #     rc = getattr(msg, "reasoning_content", None) or ""
+        #     raw_result = rc[:50] if rc else ""
+        # name_map = {}
+        # for n, cfg in agent_configs.items():
+        #     name_map[n] = n
+        #     name_map[cfg.get("display_name", "")] = n
+        # name_map["nahida"] = "nahida"
+        # name_map["纳西妲"] = "nahida"
+        # targets = []
+        # seen = set()
+        # for part in raw_result.replace("，", ",").split(","):
+        #     part = part.strip()
+        #     if not part:
+        #         continue
+        #     matched = name_map.get(part)
+        #     if not matched:
+        #         for key, val in name_map.items():
+        #             if key and key in part and val not in seen:
+        #                 matched = val
+        #                 break
+        #     if matched and matched not in seen:
+        #         targets.append(matched)
+        #         seen.add(matched)
+        # if not targets:
+        #     targets = ["nahida"]
 
         valid_targets = [t for t in targets if t in agent_configs or t == "nahida"]
         if not valid_targets:
@@ -283,7 +413,8 @@ class RouterNode:
                 display_names.append(t)
 
         if not (len(valid_targets) == 1 and valid_targets[0] == "nahida"):
-            await state.push_progress(f"🔀 LLM路由分析完成 → 交给{', '.join(display_names)}{'并行处理' if len(valid_targets) > 1 else ''}")
+            route_method = "信念路由" if self._belief_router else "LLM路由"
+            await state.push_progress(f"🔀 {route_method}分析完成 → 交给{', '.join(display_names)}{'并行处理' if len(valid_targets) > 1 else ''}")
 
         return {
             "route_targets": valid_targets,
@@ -293,10 +424,11 @@ class RouterNode:
 
 
 class ParallelAgentNode:
-    def __init__(self, dispatcher: AgentDispatcher, route_client: AsyncOpenAI, route_model: str = "mimo-v2.5"):
+    def __init__(self, dispatcher: AgentDispatcher, route_client: AsyncOpenAI, route_model: str = "mimo-v2.5", belief_router: BeliefRouter | None = None):
         self._dispatcher = dispatcher
         self._route_client = route_client
         self._route_model = route_model
+        self._belief_router = belief_router
 
     def _build_decompose_prompt(self, user_input: str, targets: list[str], agent_configs: dict) -> str:
         target_descs = []
@@ -375,6 +507,9 @@ class ParallelAgentNode:
     async def execute_single(self, target: str, task_prompt: str, state: TaskState) -> dict | None:
         agent = self._dispatcher.get_agent(target)
         if not agent or not agent.available:
+            RouterNode._route_cache.invalidate_agent(target)
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"agent": target, "display_name": target, "reply": f"{target}暂时不可用", "error": True}
 
         display_name = agent.config.display_name
@@ -385,10 +520,19 @@ class ParallelAgentNode:
             )
             if reply is None:
                 reply = f"{display_name}现在有点累了...等会儿再来吧！💤"
+                if self._belief_router:
+                    self._belief_router.update_belief(target, False)
+            else:
+                if self._belief_router:
+                    self._belief_router.update_belief(target, True)
             return {"agent": target, "display_name": display_name, "reply": reply}
         except asyncio.TimeoutError:
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"agent": target, "display_name": display_name, "reply": f"{display_name}处理超时", "error": True}
         except Exception as e:
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"agent": target, "display_name": display_name, "reply": f"{display_name}处理出错: {e}", "error": True}
 
     async def execute(self, state: TaskState) -> dict:
@@ -441,8 +585,9 @@ class ParallelAgentNode:
 
 
 class AgentNode:
-    def __init__(self, dispatcher: AgentDispatcher):
+    def __init__(self, dispatcher: AgentDispatcher, belief_router: BeliefRouter | None = None):
         self._dispatcher = dispatcher
+        self._belief_router = belief_router
 
     async def execute(self, state: TaskState) -> dict:
         target = state.route_target
@@ -452,6 +597,8 @@ class AgentNode:
         agent = self._dispatcher.get_agent(target)
         if not agent or not agent.available:
             await state.push_progress(f"⚠️ {target}暂时不可用")
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"sub_agent_reply": f"该Agent暂时不可用", "final_output": ""}
 
         display_name = agent.config.display_name
@@ -464,6 +611,11 @@ class AgentNode:
             )
             if reply is None:
                 reply = f"{display_name}现在有点累了...等会儿再来吧！💤"
+                if self._belief_router:
+                    self._belief_router.update_belief(target, False)
+            else:
+                if self._belief_router:
+                    self._belief_router.update_belief(target, True)
 
             await state.push_progress(get_status_msg(target, "done", f"{display_name}已完成！", agent.config.personality_file))
 
@@ -471,15 +623,20 @@ class AgentNode:
             intermediate = list(state.intermediate_results)
             intermediate.append(result_entry)
 
-            return {"sub_agent_reply": reply, "intermediate_results": intermediate}
+            # 单Agent时直接输出，跳过SynthesisNode
+            return {"sub_agent_reply": reply, "intermediate_results": intermediate, "final_output": reply, "skip_synthesis": True}
 
         except asyncio.TimeoutError:
             logger.warning("agent_node.timeout", target=target)
             await state.push_progress(f"⏰ {display_name}处理超时")
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"sub_agent_reply": f"{display_name}处理超时，请稍后再试"}
         except Exception as e:
             logger.error("agent_node.execute_failed", target=target, error=str(e))
             await state.push_progress(f"❌ {display_name}处理失败")
+            if self._belief_router:
+                self._belief_router.update_belief(target, False)
             return {"sub_agent_reply": f"处理出错: {e}"}
 
 
@@ -522,6 +679,7 @@ class SynthesisNode:
             except Exception as e:
                 logger.warning("synthesis.nahida_failed", error=str(e))
 
+        # nahida_chat不可用时，使用LLM综合作为后备
         if len(results) == 1:
             return {"final_output": results[0].get("reply", state.sub_agent_reply)}
 
@@ -551,6 +709,8 @@ async def route_condition(state: TaskState) -> str:
     targets = state.route_targets
     if not targets or (len(targets) == 1 and targets[0] == "nahida"):
         return END
+    if getattr(state, 'skip_synthesis', False):
+        return END
     if len(targets) > 1:
         return PARALLEL_EXECUTE
     return SINGLE_EXECUTE
@@ -559,9 +719,11 @@ async def route_condition(state: TaskState) -> str:
 def build_task_graph(dispatcher: AgentDispatcher, agent_configs: dict,
                      route_client: AsyncOpenAI, route_model: str = "mimo-v2.5",
                      nahida_chat_callback=None) -> TaskGraph:
-    router = RouterNode(route_client, route_model)
-    parallel_node = ParallelAgentNode(dispatcher, route_client, route_model)
-    agent_node = AgentNode(dispatcher)
+    db_path = str(DATA_DIR / "agent.db")
+    belief_router = BeliefRouter(db_path=db_path)
+    router = RouterNode(route_client, route_model, belief_router=belief_router)
+    parallel_node = ParallelAgentNode(dispatcher, route_client, route_model, belief_router=belief_router)
+    agent_node = AgentNode(dispatcher, belief_router=belief_router)
     synthesis = SynthesisNode(route_client, route_model, nahida_chat_callback=nahida_chat_callback)
 
     graph = TaskGraph()
@@ -587,7 +749,7 @@ def build_task_graph(dispatcher: AgentDispatcher, agent_configs: dict,
 
     graph.add_conditional_edge("router", route_condition)
     graph.add_conditional_edge(PARALLEL_EXECUTE, lambda s: "synthesis")
-    graph.add_conditional_edge(SINGLE_EXECUTE, lambda s: "synthesis")
+    graph.add_conditional_edge(SINGLE_EXECUTE, lambda s: END if getattr(s, 'skip_synthesis', False) else "synthesis")
     graph.add_conditional_edge("synthesis", lambda s: END)
 
     graph.compile()
@@ -597,6 +759,7 @@ def build_task_graph(dispatcher: AgentDispatcher, agent_configs: dict,
     graph._router = router
     graph._route_client = route_client
     graph._route_model = route_model
+    graph._belief_router = belief_router
 
     return graph
 

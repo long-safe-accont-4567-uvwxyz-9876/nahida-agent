@@ -14,6 +14,30 @@
     "max_iterations": 15
   },
 
+  // ===== MiMo 模型配置 =====
+  "mimo": {
+    "provider": "mimo",
+    "model_name": "mimo-v2.5",
+    "base_url": "https://api.xiaomimimo.com/v1",
+    "pro_model_name": "mimo-v2.5-pro",
+    "tts_model_name": "mimo-v2.5-tts-voiceclone"
+  },
+
+  // ===== Nudge 引擎配置 =====
+  "nudge": {
+    "enabled": true,
+    "interval": 3600,
+    "greeting_threshold": 3600,
+    "dnd_start": 23,
+    "dnd_end": 7
+  },
+
+  // ===== 日志配置 =====
+  "logging": {
+    "level": "INFO",
+    "file_path": "logs/agent.log"
+  },
+
   // ===== 插件开关 =====
   "plugins": {
     "qq_bot": true,

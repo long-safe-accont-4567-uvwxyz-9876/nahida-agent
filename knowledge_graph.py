@@ -9,12 +9,12 @@ from db_knowledge import KnowledgeDB
 ENTITY_EXTRACT_PROMPT = """从以下对话摘要中提取关键实体和关系，只提取最显著的3-5个。
 
 严格输出JSON，不要添加任何其他文字。格式如下：
-{"entities": [{"name": "实体名", "kind": "人物/游戏/地点/概念/物品", "observations": ["观察1"]}], "relations": [{"from": "实体A", "relation": "关系类型", "to": "实体B"}]}
+{"entities": [{"name": "实体名", "kind": "人物/游戏/地点/概念/物品", "observations": ["观察1"]}], "relations": [{"from_entity": "实体A", "relation_type": "关系类型", "to_entity": "实体B"}]}
 
 规则：
 1. 只提取明确提及的实体，不要推测
 2. observations 是关于实体的具体描述
-3. relation 使用简洁的动词短语，如"喜欢"、"属于"、"住在"
+3. relation_type 使用简洁的动词短语，如"喜欢"、"属于"、"住在"
 4. 如果没有明确的实体和关系，返回 {"entities": [], "relations": []}
 
 对话摘要：

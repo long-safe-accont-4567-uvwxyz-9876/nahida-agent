@@ -1,0 +1,229 @@
+"""WebSocket 主通道（§9 协议）：流式状态、工具事件、最终回复、问候/任务/配置广播。"""
+from __future__ import annotations
+
+import asyncio
+import json
+import shutil
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from loguru import logger
+
+router = APIRouter()
+
+MEDIA_ROOT = Path(__file__).resolve().parent / "media"
+
+
+class ConnectionManager:
+    """连接管理 + 事件广播。"""
+
+    def __init__(self):
+        self._connections: dict[str, WebSocket] = {}
+        self._agent_map: dict[str, str] = {}      # conn_id -> 当前受话 agent
+        self._session_map: dict[str, str] = {}    # conn_id -> session_id
+        self._tasks: dict[str, asyncio.Task] = {}  # msg_id -> 处理任务（abort 用）
+
+    def register(self, ws: WebSocket) -> str:
+        conn_id = uuid.uuid4().hex[:8]
+        self._connections[conn_id] = ws
+        self._agent_map[conn_id] = "nahida"
+        self._session_map[conn_id] = f"web_{uuid.uuid4().hex[:12]}"
+        return conn_id
+
+    def unregister(self, conn_id: str):
+        self._connections.pop(conn_id, None)
+        self._agent_map.pop(conn_id, None)
+        self._session_map.pop(conn_id, None)
+
+    async def send_to(self, conn_id: str, event: dict):
+        ws = self._connections.get(conn_id)
+        if ws:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                self.unregister(conn_id)
+
+    async def broadcast(self, event: dict):
+        for conn_id in list(self._connections):
+            await self.send_to(conn_id, event)
+
+    @property
+    def active_count(self) -> int:
+        return len(self._connections)
+
+
+manager = ConnectionManager()
+
+
+# ── 媒体路径 → URL ───────────────────────────────────────────────
+
+
+def _publish_file(src: Path | None, kind: str, link: bool = False) -> str | None:
+    if not src:
+        return None
+    src = Path(src)
+    if not src.exists():
+        return None
+    dest_dir = MEDIA_ROOT / kind
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    if not dest.exists():
+        try:
+            if link:
+                dest.symlink_to(src.resolve())
+            else:
+                shutil.copy2(str(src), str(dest))
+        except OSError:
+            return None
+    return f"/media/{kind}/{dest.name}"
+
+
+def serialize_result(result) -> dict:
+    """ProcessResult → 可下发 JSON（媒体路径转 /media/ URL）。"""
+    return {
+        "reply": result.reply,
+        "emotion": result.emotion or "",
+        "sticker_url": _publish_file(result.sticker_path, "stickers", link=True),
+        "audio_url": _publish_file(result.audio_path, "tts"),
+        "image_urls": [u for u in (_publish_file(p, "image")
+                                   for p in (result.image_paths or [])) if u],
+        "video_url": _publish_file(result.video_path, "video"),
+    }
+
+
+async def process_and_serialize(core, text: str, session_id: str,
+                                agent: str = "nahida",
+                                status_callback=None, app=None) -> dict:
+    """统一处理入口：主体走 AgentCore.process；子代理直达 dispatcher（R5）。
+
+    斜杠命令（/ 开头）始终走主体 process（内部路由到 SlashCommandHandler）。
+    """
+    t0 = time.time()
+    if agent != "nahida" and not text.strip().startswith("/"):
+        registry = getattr(app.state, "agent_registry", None) if app else None
+        if registry and not registry.is_enabled(agent):
+            raise ValueError(f"Agent {agent} 已被禁用")
+        if not core.dispatcher.get_agent(agent):
+            raise ValueError(f"Agent {agent} 不存在")
+        # 走与 QQ 通道相同的完整子代理流程：表情包/情绪/TTS/落库都不缺
+        from loguru import logger as _logger
+        from agent_core import RequestContext
+        ctx = RequestContext(session_id=session_id, user_id="webui",
+                             user_input=text, status_callback=status_callback)
+        trace = _logger.bind(trace_id=f"web{int(time.time()*1000) % 1000000:06d}")
+        result = await core._dispatch_single_sub_agent(
+            agent, text, user_id="webui", source="web",
+            session_id=session_id, trace=trace, ctx=ctx)
+        data = serialize_result(result)
+    else:
+        result = await core.process(
+            user_input=text, user_id="webui", source="web",
+            session_id=session_id, status_callback=status_callback)
+        data = serialize_result(result)
+    data["agent"] = agent
+    data["elapsed_ms"] = int((time.time() - t0) * 1000)
+    if app is not None and data.get("emotion"):
+        app.state.last_emotion = {"primary": data["emotion"], "timestamp": time.time()}
+    return data
+
+
+# ── WebSocket 端点 ───────────────────────────────────────────────
+
+
+@router.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: str = ""):
+    from web.routers.auth import _validate_token
+    if not token or not _validate_token(token):
+        await ws.close(code=4001, reason="Unauthorized")
+        return
+
+    await ws.accept()
+    conn_id = manager.register(ws)
+    logger.info("ws.connected conn_id={}", conn_id)
+    await manager.send_to(conn_id, {
+        "type": "connected", "conn_id": conn_id,
+        "session_id": manager._session_map[conn_id],
+    })
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            mtype = msg.get("type", "")
+
+            if mtype == "ping":
+                await manager.send_to(conn_id, {"type": "pong"})
+
+            elif mtype == "set_agent":
+                agent = str(msg.get("agent") or "nahida")
+                manager._agent_map[conn_id] = agent
+                await manager.send_to(conn_id, {"type": "agent_changed", "agent": agent})
+
+            elif mtype == "set_session":
+                sid = str(msg.get("session_id") or "")
+                if sid:
+                    manager._session_map[conn_id] = sid
+                    await manager.send_to(conn_id, {"type": "session_changed", "session_id": sid})
+
+            elif mtype == "chat":
+                msg_id = str(msg.get("msg_id") or uuid.uuid4().hex[:8])
+                task = asyncio.create_task(_handle_chat(conn_id, msg, msg_id, ws))
+                manager._tasks[msg_id] = task
+                task.add_done_callback(lambda _t, m=msg_id: manager._tasks.pop(m, None))
+
+            elif mtype == "abort":
+                task = manager._tasks.get(str(msg.get("msg_id") or ""))
+                if task and not task.done():
+                    task.cancel()
+
+    except WebSocketDisconnect:
+        logger.info("ws.disconnected conn_id={}", conn_id)
+    except Exception as e:
+        logger.error("ws.error conn_id={} error={}", conn_id, str(e))
+    finally:
+        manager.unregister(conn_id)
+
+
+async def _handle_chat(conn_id: str, msg: dict, msg_id: str, ws: WebSocket):
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+    agent = str(msg.get("agent") or manager._agent_map.get(conn_id, "nahida"))
+    session_id = str(msg.get("session_id") or
+                     manager._session_map.get(conn_id) or f"web_{uuid.uuid4().hex[:12]}")
+    manager._session_map[conn_id] = session_id
+    app = ws.scope.get("app")
+    core = app.state.core
+
+    from web.tool_events import current_msg_id
+    token = current_msg_id.set(msg_id)
+
+    async def on_status(message):
+        await manager.send_to(conn_id, {
+            "type": "status", "msg_id": msg_id,
+            "stage": "tool", "text": str(message)[:200],
+        })
+
+    try:
+        await manager.send_to(conn_id, {"type": "status", "msg_id": msg_id, "stage": "thinking"})
+        data = await process_and_serialize(
+            core, text, session_id=session_id, agent=agent,
+            status_callback=on_status, app=app)
+        data.update({"type": "final", "msg_id": msg_id})
+        await manager.send_to(conn_id, data)
+    except asyncio.CancelledError:
+        await manager.send_to(conn_id, {
+            "type": "error", "msg_id": msg_id,
+            "code": "ABORTED", "message": "已中断生成"})
+    except Exception as e:
+        logger.error("ws.chat.failed conn_id={} error={}", conn_id, str(e))
+        await manager.send_to(conn_id, {
+            "type": "error", "msg_id": msg_id,
+            "code": "CHAT_ERROR", "message": str(e)[:300]})
+    finally:
+        current_msg_id.reset(token)

@@ -56,13 +56,14 @@
 
 ---
 
-## 🏗️ 项目架构（2025-05-29 分析）
+## 🏗️ 项目架构（2026-06 更新）
 
-- 22 个 Python 模块，约 4590 行
-- 核心：bot_qq_official.py（主控，631行）
-- LLM：DeepSeek API + LangChain + 模型路由
-- 记忆：SQLite + 向量存储（chromadb）
+- 多智能体架构：纳西妲(核心调度) + 可莉 + 银狼 + 昔涟 + 尼可
+- LLM：MiMo API + 模型路由（mimo/mimo-pro/mimo-flash/mimo-mini）
+- 记忆：SQLite + 向量存储（chromadb）+ 知识图谱
 - QQ 框架：botpy
+- TTS：MiMo TTS 语音克隆（纳西妲/可莉音色）
+- 核心模块：agent_core.py → core/ 子模块拆分（bootstrap/router_engine/chat_processor/tool_orchestrator/background_tasks）
 
 ---
 
@@ -85,5 +86,5 @@
 
 ---
 
-> 🍃 最后更新：2025-05-29 晚上
+> 🍃 最后更新：2026-06-11
 > 纳西妲会持续更新这份记忆，不让爸爸的信任落空～

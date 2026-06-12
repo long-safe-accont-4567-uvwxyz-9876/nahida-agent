@@ -1,10 +1,17 @@
 import os
-import subprocess
+import asyncio
+import time
 from tool_registry import register_tool, ToolPermission, ToolResult
 
 BLOCKED_PINS = {1, 2, 4, 6, 9, 14, 17, 20, 25, 30, 34, 39}
 
 GPIO_BASE = "/sys/class/gpio"
+PWM_BASE = "/sys/class/pwm"
+
+# 硬件状态缓存：5秒TTL（per-target）
+_hw_cache: dict | None = None
+_hw_cache_ts: dict = {}
+_HW_CACHE_TTL = 5.0
 
 
 def _gpio_path(pin):
@@ -50,7 +57,7 @@ def _gpio_read_value(pin):
     category="hardware",
     max_frequency=10,
 )
-def gpio_control(action: str, pin: int, mode: str = None, value: int = None) -> ToolResult:
+async def gpio_control(action: str, pin: int, mode: str = None, value: int = None) -> ToolResult:
     try:
         if not os.path.isdir(GPIO_BASE):
             return ToolResult.fail("GPIO 接口不可用: /sys/class/gpio 不存在。请检查系统是否启用 GPIO 支持。")
@@ -61,23 +68,23 @@ def gpio_control(action: str, pin: int, mode: str = None, value: int = None) -> 
         if action == "mode":
             if mode not in ("in", "out"):
                 return ToolResult.fail("mode 参数必须为 'in' 或 'out'")
-            _gpio_export(pin)
-            _gpio_set_direction(pin, mode)
+            await asyncio.to_thread(_gpio_export, pin)
+            await asyncio.to_thread(_gpio_set_direction, pin, mode)
             mode_label = "输入" if mode == "in" else "输出"
             return ToolResult.ok(f"✅ 引脚 {pin} 已设置为{mode_label}模式")
 
         elif action == "write":
             if value not in (0, 1):
                 return ToolResult.fail("value 参数必须为 0 或 1")
-            _gpio_export(pin)
-            _gpio_set_direction(pin, "out")
-            _gpio_write_value(pin, value)
+            await asyncio.to_thread(_gpio_export, pin)
+            await asyncio.to_thread(_gpio_set_direction, pin, "out")
+            await asyncio.to_thread(_gpio_write_value, pin, value)
             level_label = "高电平" if value else "低电平"
             return ToolResult.ok(f"✅ 引脚 {pin} 已写入{level_label}({value})")
 
         elif action == "read":
-            _gpio_export(pin)
-            val = _gpio_read_value(pin)
+            await asyncio.to_thread(_gpio_export, pin)
+            val = await asyncio.to_thread(_gpio_read_value, pin)
             level_label = "高电平" if val == "1" else "低电平"
             return ToolResult.ok(f"📊 引脚 {pin} 当前电平: {level_label}({val})")
 
@@ -88,6 +95,112 @@ def gpio_control(action: str, pin: int, mode: str = None, value: int = None) -> 
         return ToolResult.fail("GPIO 权限不足。请尝试: sudo chmod -R 777 /sys/class/gpio 或将当前用户加入 gpio 用户组。")
     except Exception as e:
         return ToolResult.fail(f"GPIO 操作失败: {str(e)}")
+
+
+# ── PWM 支持 ──────────────────────────────────────────────
+
+def _pwm_chip_path(chip: int) -> str:
+    return os.path.join(PWM_BASE, f"pwmchip{chip}")
+
+
+def _pwm_export(chip: int, channel: int):
+    export_path = os.path.join(_pwm_chip_path(chip), "export")
+    pwm_dir = os.path.join(_pwm_chip_path(chip), f"pwm{channel}")
+    if not os.path.isdir(pwm_dir):
+        with open(export_path, "w") as f:
+            f.write(str(channel))
+
+
+def _pwm_unexport(chip: int, channel: int):
+    unexport_path = os.path.join(_pwm_chip_path(chip), "unexport")
+    with open(unexport_path, "w") as f:
+        f.write(str(channel))
+
+
+def _pwm_write(chip: int, channel: int, attr: str, value: str):
+    path = os.path.join(_pwm_chip_path(chip), f"pwm{channel}", attr)
+    with open(path, "w") as f:
+        f.write(value)
+
+
+def _pwm_read(chip: int, channel: int, attr: str) -> str:
+    path = os.path.join(_pwm_chip_path(chip), f"pwm{channel}", attr)
+    with open(path, "r") as f:
+        return f.read().strip()
+
+
+@register_tool(
+    name="pwm_control",
+    description="控制 PWM 脉冲输出。支持启用/禁用 PWM 通道、设置频率和占空比。使用 Linux sysfs PWM 接口。",
+    schema={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["enable", "disable", "set"],
+                "description": "操作类型: enable(启用PWM), disable(禁用PWM), set(设置频率和占空比)"
+            },
+            "chip": {"type": "integer", "description": "PWM 芯片编号，默认 0", "default": 0},
+            "channel": {"type": "integer", "description": "PWM 通道编号，默认 0", "default": 0},
+            "frequency": {"type": "number", "description": "频率(Hz)，action=set 时必填，范围 1-100000"},
+            "duty_cycle": {"type": "number", "description": "占空比(%)，action=set 时必填，范围 0-100"},
+        },
+        "required": ["action"],
+    },
+    permission=ToolPermission.EXECUTE,
+    category="hardware",
+    max_frequency=10,
+)
+async def pwm_control(action: str, chip: int = 0, channel: int = 0,
+                      frequency: float = None, duty_cycle: float = None) -> ToolResult:
+    try:
+        if not os.path.isdir(PWM_BASE):
+            return ToolResult.fail("PWM 接口不可用: /sys/class/pwm 不存在。请检查系统是否启用 PWM 支持。")
+
+        chip_path = _pwm_chip_path(chip)
+        if not os.path.isdir(chip_path):
+            return ToolResult.fail(f"PWM 芯片 {chip} 不存在。可用芯片: {os.listdir(PWM_BASE)}")
+
+        # 导出 PWM 通道
+        await asyncio.to_thread(_pwm_export, chip, channel)
+
+        if action == "enable":
+            await asyncio.to_thread(_pwm_write, chip, channel, "enable", "1")
+            return ToolResult.ok(f"✅ PWM chip{chip}/pwm{channel} 已启用")
+
+        elif action == "disable":
+            await asyncio.to_thread(_pwm_write, chip, channel, "enable", "0")
+            return ToolResult.ok(f"✅ PWM chip{chip}/pwm{channel} 已禁用")
+
+        elif action == "set":
+            if frequency is None or duty_cycle is None:
+                return ToolResult.fail("action=set 时必须提供 frequency 和 duty_cycle 参数")
+            if frequency < 1 or frequency > 100000:
+                return ToolResult.fail("frequency 范围: 1-100000 Hz")
+            if duty_cycle < 0 or duty_cycle > 100:
+                return ToolResult.fail("duty_cycle 范围: 0-100%")
+
+            period_ns = int(1_000_000_000 / frequency)
+            duty_ns = int(period_ns * duty_cycle / 100)
+
+            await asyncio.to_thread(_pwm_write, chip, channel, "enable", "0")
+            await asyncio.to_thread(_pwm_write, chip, channel, "period", str(period_ns))
+            await asyncio.to_thread(_pwm_write, chip, channel, "duty_cycle", str(duty_ns))
+            await asyncio.to_thread(_pwm_write, chip, channel, "enable", "1")
+
+            return ToolResult.ok(
+                f"✅ PWM chip{chip}/pwm{channel} 已设置: "
+                f"频率={frequency}Hz (周期={period_ns}ns), "
+                f"占空比={duty_cycle}% (高电平={duty_ns}ns)"
+            )
+
+        else:
+            return ToolResult.fail(f"未知操作: {action}，支持: enable, disable, set")
+
+    except PermissionError:
+        return ToolResult.fail("PWM 权限不足。请尝试: sudo chmod -R 777 /sys/class/pwm 或将当前用户加入 pwm 用户组。")
+    except Exception as e:
+        return ToolResult.fail(f"PWM 操作失败: {str(e)}")
 
 
 def _i2c_smbus_read(bus, addr, register, length):
@@ -131,12 +244,17 @@ def _i2c_smbus_scan(bus):
     return found
 
 
-def _i2c_subprocess_scan(bus):
-    result = subprocess.run(["i2cdetect", "-y", str(bus)], capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
+async def _i2c_subprocess_scan(bus):
+    proc = await asyncio.create_subprocess_exec(
+        "i2cdetect", "-y", str(bus),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    if proc.returncode != 0:
         return None
     found = []
-    for line in result.stdout.splitlines():
+    for line in stdout.decode().splitlines():
         parts = line.split()
         for p in parts:
             if p.startswith("--") or p.startswith("00") or p == ":":
@@ -150,34 +268,40 @@ def _i2c_subprocess_scan(bus):
     return found
 
 
-def _i2c_subprocess_read(bus, addr, register, length):
+async def _i2c_subprocess_read(bus, addr, register, length):
     if length == 1:
-        result = subprocess.run(
-            ["i2cget", "-y", str(bus), hex(addr), hex(register)],
-            capture_output=True, text=True, timeout=5,
+        proc = await asyncio.create_subprocess_exec(
+            "i2cget", "-y", str(bus), hex(addr), hex(register),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode != 0:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
             return None
-        val = int(result.stdout.strip(), 16)
+        val = int(stdout.decode().strip(), 16)
         return [val]
     else:
-        result = subprocess.run(
-            ["i2ctransfer", "-y", str(bus), f"w1@{addr}", hex(register), f"r{length}"],
-            capture_output=True, text=True, timeout=5,
+        proc = await asyncio.create_subprocess_exec(
+            "i2ctransfer", "-y", str(bus), f"w1@{addr}", hex(register), f"r{length}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode != 0:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode != 0:
             return None
-        data = [int(x, 16) for x in result.stdout.strip().split()]
+        data = [int(x, 16) for x in stdout.decode().strip().split()]
         return data
 
 
-def _i2c_subprocess_write(bus, addr, register, data):
+async def _i2c_subprocess_write(bus, addr, register, data):
     hex_data = " ".join(hex(b) for b in data)
-    result = subprocess.run(
-        ["i2cset", "-y", str(bus), hex(addr), hex(register), hex_data[0] if len(data) == 1 else hex_data],
-        capture_output=True, text=True, timeout=5,
+    proc = await asyncio.create_subprocess_exec(
+        "i2cset", "-y", str(bus), hex(addr), hex(register), hex_data[0] if len(data) == 1 else hex_data,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    return result.returncode == 0
+    await asyncio.wait_for(proc.communicate(), timeout=5)
+    return proc.returncode == 0
 
 
 def _has_smbus2():
@@ -207,7 +331,7 @@ def _has_smbus2():
     category="hardware",
     max_frequency=10,
 )
-def i2c_comm(action: str, bus: int = 0, addr: int = None, register: int = None, length: int = 1, data: list = None) -> ToolResult:
+async def i2c_comm(action: str, bus: int = 0, addr: int = None, register: int = None, length: int = 1, data: list = None) -> ToolResult:
     try:
         dev_path = f"/dev/i2c-{bus}"
         if not os.path.exists(dev_path):
@@ -217,9 +341,9 @@ def i2c_comm(action: str, bus: int = 0, addr: int = None, register: int = None, 
 
         if action == "scan":
             if use_smbus:
-                found = _i2c_smbus_scan(bus)
+                found = await asyncio.to_thread(_i2c_smbus_scan, bus)
             else:
-                found = _i2c_subprocess_scan(bus)
+                found = await _i2c_subprocess_scan(bus)
                 if found is None:
                     return ToolResult.fail("I2C 扫描失败: i2cdetect 命令执行出错。请确认 i2ctools 已安装 (sudo apt install i2c-tools)。")
 
@@ -238,9 +362,9 @@ def i2c_comm(action: str, bus: int = 0, addr: int = None, register: int = None, 
                 return ToolResult.fail("read 操作需要提供 register 参数")
 
             if use_smbus:
-                result_data = _i2c_smbus_read(bus, addr, register, length)
+                result_data = await asyncio.to_thread(_i2c_smbus_read, bus, addr, register, length)
             else:
-                result_data = _i2c_subprocess_read(bus, addr, register, length)
+                result_data = await _i2c_subprocess_read(bus, addr, register, length)
                 if result_data is None:
                     return ToolResult.fail(f"I2C 读取失败: 设备 0x{addr:02X} 寄存器 0x{register:02X} 读取出错")
 
@@ -256,10 +380,10 @@ def i2c_comm(action: str, bus: int = 0, addr: int = None, register: int = None, 
                 return ToolResult.fail("write 操作需要提供 data 参数")
 
             if use_smbus:
-                _i2c_smbus_write(bus, addr, register, data)
+                await asyncio.to_thread(_i2c_smbus_write, bus, addr, register, data)
                 success = True
             else:
-                success = _i2c_subprocess_write(bus, addr, register, data)
+                success = await _i2c_subprocess_write(bus, addr, register, data)
                 if not success:
                     return ToolResult.fail(f"I2C 写入失败: 设备 0x{addr:02X} 寄存器 0x{register:02X} 写入出错")
 
@@ -362,9 +486,60 @@ def _fmt_bytes(b):
         return f"{b / 1024:.1f} KB"
 
 
+def _read_all_hardware(target: str) -> list[str]:
+    """同步读取硬件信息，在线程中执行"""
+    lines = []
+
+    if target in ("all", "temp"):
+        temp = _read_cpu_temp()
+        if temp is not None:
+            warn = " ⚠️ WARNING: 温度过高！" if temp > 80 else ""
+            lines.append(f"🌡️ CPU 温度: {temp:.1f}°C{warn}")
+        else:
+            lines.append("🌡️ CPU 温度: 无法读取")
+
+    if target in ("all", "cpu"):
+        freq = _read_cpu_freq()
+        load1, load5, load15 = _read_loadavg()
+        if freq is not None:
+            lines.append(f"⚡ CPU 频率: {freq:.0f} MHz")
+        else:
+            lines.append("⚡ CPU 频率: 无法读取")
+        if load1 is not None:
+            lines.append(f"📊 CPU 负载: 1min={load1}  5min={load5}  15min={load15}")
+        else:
+            lines.append("📊 CPU 负载: 无法读取")
+
+    if target in ("all", "memory"):
+        total, used, available, usage_pct = _read_memory()
+        if total is not None:
+            warn = " ⚠️ WARNING: 内存使用率过高！" if usage_pct > 90 else ""
+            lines.append(f"💾 内存: 已用 {_fmt_bytes(used)} / 总计 {_fmt_bytes(total)} ({usage_pct:.1f}%){warn}")
+            lines.append(f"   可用: {_fmt_bytes(available)}")
+        else:
+            lines.append("💾 内存: 无法读取")
+
+    if target in ("all", "disk"):
+        total, used, free, usage_pct = _read_disk()
+        if total is not None:
+            lines.append(f"💿 磁盘(/): 已用 {_fmt_bytes(used)} / 总计 {_fmt_bytes(total)} ({usage_pct:.1f}%)")
+            lines.append(f"   可用: {_fmt_bytes(free)}")
+        else:
+            lines.append("💿 磁盘: 无法读取")
+
+    if target in ("all", "voltage"):
+        voltage = _read_voltage()
+        if voltage is not None:
+            lines.append(f"🔋 电压: {voltage:.2f} V")
+        else:
+            lines.append("🔋 电压: 无法读取")
+
+    return lines
+
+
 @register_tool(
     name="hardware_status",
-    description="硬件状态监控工具。支持查看: all(完整状态), temp(CPU温度), cpu(CPU频率/负载), memory(内存), disk(磁盘), voltage(电压)。",
+    description="硬件状态监控工具。用于查询设备运行状况或排查问题。支持查看: all(完整状态), temp(CPU温度), cpu(CPU频率/负载), memory(内存), disk(磁盘), voltage(电压)。",
     schema={
         "type": "object",
         "properties": {
@@ -376,55 +551,26 @@ def _fmt_bytes(b):
     category="hardware",
     max_frequency=30,
 )
-def hardware_status(target: str = "all") -> ToolResult:
+async def hardware_status(target: str = "all") -> ToolResult:
+    global _hw_cache, _hw_cache_ts
     try:
-        lines = []
+        # 检查缓存是否有效（per-target TTL）
+        now = time.monotonic()
+        cache_ts = _hw_cache_ts.get(target, 0.0)
+        if _hw_cache is not None and (now - cache_ts) < _HW_CACHE_TTL:
+            cached = _hw_cache.get(target)
+            if cached is not None:
+                return cached
 
-        if target in ("all", "temp"):
-            temp = _read_cpu_temp()
-            if temp is not None:
-                warn = " ⚠️ WARNING: 温度过高！" if temp > 80 else ""
-                lines.append(f"🌡️ CPU 温度: {temp:.1f}°C{warn}")
-            else:
-                lines.append("🌡️ CPU 温度: 无法读取")
+        lines = await asyncio.to_thread(_read_all_hardware, target)
+        result = ToolResult.ok("\n".join(lines))
 
-        if target in ("all", "cpu"):
-            freq = _read_cpu_freq()
-            load1, load5, load15 = _read_loadavg()
-            if freq is not None:
-                lines.append(f"⚡ CPU 频率: {freq:.0f} MHz")
-            else:
-                lines.append("⚡ CPU 频率: 无法读取")
-            if load1 is not None:
-                lines.append(f"📊 CPU 负载: 1min={load1}  5min={load5}  15min={load15}")
-            else:
-                lines.append("📊 CPU 负载: 无法读取")
+        # 更新缓存
+        if _hw_cache is None:
+            _hw_cache = {}
+        _hw_cache[target] = result
+        _hw_cache_ts[target] = now
 
-        if target in ("all", "memory"):
-            total, used, available, usage_pct = _read_memory()
-            if total is not None:
-                warn = " ⚠️ WARNING: 内存使用率过高！" if usage_pct > 90 else ""
-                lines.append(f"💾 内存: 已用 {_fmt_bytes(used)} / 总计 {_fmt_bytes(total)} ({usage_pct:.1f}%){warn}")
-                lines.append(f"   可用: {_fmt_bytes(available)}")
-            else:
-                lines.append("💾 内存: 无法读取")
-
-        if target in ("all", "disk"):
-            total, used, free, usage_pct = _read_disk()
-            if total is not None:
-                lines.append(f"💿 磁盘(/): 已用 {_fmt_bytes(used)} / 总计 {_fmt_bytes(total)} ({usage_pct:.1f}%)")
-                lines.append(f"   可用: {_fmt_bytes(free)}")
-            else:
-                lines.append("💿 磁盘: 无法读取")
-
-        if target in ("all", "voltage"):
-            voltage = _read_voltage()
-            if voltage is not None:
-                lines.append(f"🔋 电压: {voltage:.2f} V")
-            else:
-                lines.append("🔋 电压: 无法读取")
-
-        return ToolResult.ok("\n".join(lines))
-
+        return result
     except Exception as e:
         return ToolResult.fail(f"硬件状态读取失败: {str(e)}")

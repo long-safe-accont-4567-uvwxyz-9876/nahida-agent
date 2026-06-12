@@ -1,10 +1,217 @@
 import subprocess
 import os
+import re
+import shlex
+import urllib.parse
 from pathlib import Path
 from tool_registry import register_tool, ToolPermission, ToolResult
 
 
-BLOCKED_COMMANDS = {'rm -rf /', 'mkfs', 'dd if='}
+# ==================== 文件路径沙箱 ====================
+
+# 项目根目录（tools 的上级目录）
+_PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 允许访问的基础目录白名单
+ALLOWED_BASE_DIRS = [
+    _PROJECT_DIR,                                                          # 项目目录
+    os.path.expanduser("~/ai-agent"),                                      # 用户主目录下的项目目录
+    "/tmp",
+    "/var/tmp",
+    os.path.join(_PROJECT_DIR, "tts_cache"),                               # tts_cache 目录
+    os.environ.get("NAHIDA_DATA_DIR", "/media/orangepi/KIOXIA/nahida-data"),  # 数据目录
+]
+
+# 敏感路径黑名单（即使白名单通过也不允许访问）
+SENSITIVE_PATHS = [
+    "/etc/shadow",
+    "/etc/passwd",
+    os.path.expanduser("~/.ssh"),
+    os.path.expanduser("~/.gnupg"),
+    "/root",
+]
+
+# 规范化白名单和黑名单（realpath）
+ALLOWED_BASE_DIRS = [os.path.realpath(d) for d in ALLOWED_BASE_DIRS if os.path.exists(d) or True]
+SENSITIVE_PATHS = [os.path.realpath(d) for d in SENSITIVE_PATHS]
+
+
+def _validate_path(path: str, mode: str = "read") -> tuple[bool, str, str]:
+    """验证路径是否在沙箱允许范围内。
+
+    Args:
+        path: 待验证的路径
+        mode: "read" 或 "write"
+
+    Returns:
+        (is_allowed, resolved_path, reason)
+    """
+    # 展开用户目录并解析真实路径
+    expanded = os.path.expanduser(path)
+    # 对于不存在的路径，先规范化目录部分
+    if os.path.exists(expanded):
+        resolved = os.path.realpath(expanded)
+    else:
+        # 路径不存在时，规范化到最近的已存在父目录 + 剩余部分
+        parent = expanded
+        remainder = ""
+        while not os.path.exists(parent):
+            parent, tail = os.path.split(parent)
+            remainder = os.path.join(tail, remainder) if remainder else tail
+        resolved_parent = os.path.realpath(parent)
+        resolved = os.path.join(resolved_parent, remainder) if remainder else resolved_parent
+
+    # 检查敏感路径黑名单
+    for sensitive in SENSITIVE_PATHS:
+        if resolved == sensitive or resolved.startswith(sensitive + os.sep):
+            return False, resolved, f"路径在敏感目录中，禁止访问: {sensitive}"
+    # 额外检查 .env 文件
+    if os.path.basename(resolved) == ".env" or "/.env" in resolved:
+        return False, resolved, "禁止访问 .env 文件"
+
+    # 检查白名单
+    for allowed in ALLOWED_BASE_DIRS:
+        if resolved == allowed or resolved.startswith(allowed + os.sep):
+            # 写入模式额外限制：只允许项目目录和 tts_cache
+            if mode == "write":
+                write_allowed = [_PROJECT_DIR, os.path.join(_PROJECT_DIR, "tts_cache"), "/tmp", "/var/tmp"]
+                write_allowed = [os.path.realpath(d) for d in write_allowed]
+                for wa in write_allowed:
+                    if resolved == wa or resolved.startswith(wa + os.sep):
+                        return True, resolved, ""
+                return False, resolved, f"写入路径不在允许的写入目录中，仅允许项目目录、tts_cache、/tmp、/var/tmp"
+            return True, resolved, ""
+
+    return False, resolved, f"路径不在允许的目录范围内: {path}"
+
+
+# 安全加固：拦截危险操作（开发板模式，保留基本 shell 执行能力）
+BLOCKED_COMMANDS = {
+    # 递归强制删除
+    'rm -rf', 'rm -fr', 'rm -r -f', 'rm -f -r',
+    # 磁盘操作
+    'dd', 'mkfs', 'mkfs.ext4', 'mkfs.ext3', 'mkfs.vfat', 'mkfs.ntfs',
+    'fdisk', 'cfdisk', 'parted', 'format',
+    # 危险权限修改
+    'chmod 777', 'chmod -R 777', 'chmod 000',
+    'chown', 'chgrp',
+    # 系统关停
+    'shutdown', 'reboot', 'poweroff', 'halt', 'init 0', 'init 6',
+    # 反向 shell 工具
+    'nc -e', 'ncat -e', 'socat exec',
+    # 危险覆盖
+    'shred', 'wipe',
+}
+
+# 危险命令模式（正则，不区分大小写）
+_DANGEROUS_PATTERNS = [
+    # rm -rf 任意路径（不只是根目录）
+    r'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+|--recursive\s+--force\s+)\S+',
+    # fork bomb 变体
+    r':\(\)\{\s*:\|:&\s*\}',
+    r'\w+\(\)\{\s*\w+\|:\&\s*\}',
+    r'fork\s+bomb',
+    # 管道到 shell
+    r'\|\s*(ba)?sh\b',
+    r'\|\s*(ba)?sh\s+-c\b',
+    # 命令替换
+    r'\$\([^)]*\)',
+    r'`[^`]+`',
+    # 反向 shell
+    r'(nc|ncat|socat)\s+.*(-e|--exec)\s+',
+    r'(nc|ncat)\s+.*(-e|--sh-exec)\s+',
+    # curl/wget 管道到 shell
+    r'(curl|wget)\s+.*\|\s*(ba)?sh',
+    # 危险重定向覆盖
+    r'>\s*/dev/sd[a-z]',
+    r'>\s*/dev/nand',
+    r'>\s*/dev/mmcblk',
+    # 内核模块操作
+    r'rmmod\s+',
+    r'modprobe\s+-r\s+',
+    # 覆写关键系统文件
+    r'>\s*/etc/passwd',
+    r'>\s*/etc/shadow',
+    r'>\s*/etc/sudoers',
+]
+
+# 输出中需要遮蔽的敏感信息模式
+_SENSITIVE_OUTPUT_PATTERNS = [
+    # /etc/shadow 中的密码哈希
+    (r'(\$6\$|\$5\$|\$1\$)[a-zA-Z0-9./]{0,16}\$[a-zA-Z0-9./]{1,86}', '[HASH_REDACTED]'),
+    # API Key 模式
+    (r'(api[_-]?key|apikey|access[_-]?token|secret[_-]?key)\s*[=:]\s*["\']?\s*[a-zA-Z0-9_\-]{20,}', r'\1=[REDACTED]'),
+    # 私钥标识
+    (r'-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----', '[PRIVATE_KEY_REDACTED]'),
+    # 常见 token 格式
+    (r'(Bearer|token)\s+[a-zA-Z0-9_\-\.]{20,}', r'\1 [REDACTED]'),
+]
+
+
+def _normalize_command(command: str) -> str:
+    """规范化命令字符串，处理编码绕过尝试"""
+    normalized = command
+    # URL 解码（可能多层编码）
+    for _ in range(3):
+        try:
+            decoded = urllib.parse.unquote(normalized)
+            if decoded == normalized:
+                break
+            normalized = decoded
+        except Exception:
+            break
+    # hex 编码绕过：\xHH 格式
+    def _replace_hex(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    normalized = re.sub(r'\\x([0-9a-fA-F]{2})', _replace_hex, normalized)
+    # octal 编码绕过：\OOO 格式
+    def _replace_octal(m):
+        try:
+            return chr(int(m.group(1), 8))
+        except ValueError:
+            return m.group(0)
+    normalized = re.sub(r'\\([0-7]{3})', _replace_octal, normalized)
+    # unicode 编码绕过：\uHHHH 格式
+    def _replace_unicode(m):
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+    normalized = re.sub(r'\\u([0-9a-fA-F]{4})', _replace_unicode, normalized)
+    # 去除多余空格
+    normalized = ' '.join(normalized.split())
+    return normalized
+
+
+def _is_command_dangerous(command: str) -> str | None:
+    """检查命令是否危险，返回危险原因或 None。开发板模式：拦截危险操作"""
+    # 规范化：处理编码绕过
+    normalized = _normalize_command(command)
+
+    # 检查基本黑名单（对规范化后的命令检查）
+    for blocked in BLOCKED_COMMANDS:
+        if blocked in normalized or blocked in command:
+            return f"命令包含不允许的操作: {blocked}"
+
+    # 检查危险模式
+    for pattern in _DANGEROUS_PATTERNS:
+        if re.search(pattern, normalized, re.IGNORECASE):
+            return f"命令包含危险模式: {pattern}"
+        if re.search(pattern, command, re.IGNORECASE):
+            return f"命令包含危险模式: {pattern}"
+
+    return None
+
+
+def _sanitize_output(output: str) -> str:
+    """对命令输出中的敏感信息进行遮蔽"""
+    sanitized = output
+    for pattern, replacement in _SENSITIVE_OUTPUT_PATTERNS:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
+    return sanitized
 
 
 @register_tool(
@@ -22,29 +229,43 @@ BLOCKED_COMMANDS = {'rm -rf /', 'mkfs', 'dd if='}
     max_frequency=30,
 )
 def shell_command(command: str) -> ToolResult:
-    for blocked in BLOCKED_COMMANDS:
-        if blocked in command:
-            return ToolResult.fail(f"命令包含不允许的操作: {blocked}")
+    danger_reason = _is_command_dangerous(command)
+    if danger_reason:
+        return ToolResult.fail(danger_reason)
 
     try:
+        # 使用 shlex.split 解析参数，避免 shell=True 的命令注入风险
+        args = shlex.split(command)
+        if not args:
+            return ToolResult.fail("空命令")
+
         result = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=False,
             capture_output=True, text=True,
             timeout=30, cwd=os.path.expanduser("~")
         )
         output = result.stdout if result.stdout else result.stderr
-        data = output[:3000] if output else "命令执行成功（无输出）"
+        if output:
+            # 对输出进行敏感信息遮蔽
+            output = _sanitize_output(output)
+            data = output[:3000]
+        else:
+            data = "命令执行成功（无输出）"
         return ToolResult.ok(data)
     except subprocess.TimeoutExpired:
         return ToolResult.fail("命令执行超时（30秒）")
+    except ValueError as e:
+        return ToolResult.fail(f"命令解析错误（可能包含不合法的引号或转义）: {str(e)}")
+    except FileNotFoundError:
+        return ToolResult.fail(f"命令未找到: {shlex.split(command)[0] if command else ''}")
     except Exception as e:
         return ToolResult.fail(f"执行错误: {str(e)}")
 
 
 @register_tool(
     name="list_files",
-    description="列出目录中的文件和文件夹。输入目录路径，默认为当前目录。",
+    description="列出目录中的文件和文件夹。用于查看、整理或操作文件。输入目录路径，默认为当前目录。",
     schema={
         "type": "object",
         "properties": {
@@ -58,12 +279,18 @@ def shell_command(command: str) -> ToolResult:
 def list_files(path: str = "~") -> ToolResult:
     try:
         target_path = os.path.expanduser(path)
-        if not os.path.exists(target_path):
+
+        # 路径沙箱验证
+        allowed, resolved, reason = _validate_path(target_path, mode="read")
+        if not allowed:
+            return ToolResult.fail(f"路径访问被拒绝: {reason}")
+
+        if not os.path.exists(resolved):
             return ToolResult.fail(f"路径不存在: {path}")
 
         items = []
-        for item in sorted(os.listdir(target_path)):
-            full_path = os.path.join(target_path, item)
+        for item in sorted(os.listdir(resolved)):
+            full_path = os.path.join(resolved, item)
             is_dir = os.path.isdir(full_path)
             prefix = "📁" if is_dir else "📄"
             if is_dir:
@@ -79,7 +306,7 @@ def list_files(path: str = "~") -> ToolResult:
                 except OSError:
                     items.append(f"{prefix} {item}")
 
-        return ToolResult.ok(f"目录: {target_path}\n" + "\n".join(items[:50]))
+        return ToolResult.ok(f"目录: {resolved}\n" + "\n".join(items[:50]))
     except Exception as e:
         return ToolResult.fail(f"错误: {str(e)}")
 
@@ -102,16 +329,22 @@ def list_files(path: str = "~") -> ToolResult:
 def read_file(path: str, offset: int = 0, limit: int = 200) -> ToolResult:
     try:
         target_path = os.path.expanduser(path)
-        if not os.path.exists(target_path):
+
+        # 路径沙箱验证
+        allowed, resolved, reason = _validate_path(target_path, mode="read")
+        if not allowed:
+            return ToolResult.fail(f"路径访问被拒绝: {reason}")
+
+        if not os.path.exists(resolved):
             return ToolResult.fail(f"文件不存在: {path}")
-        if os.path.isdir(target_path):
+        if os.path.isdir(resolved):
             return ToolResult.fail(f"这是一个目录，不是文件: {path}")
 
-        with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(resolved, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
         selected = lines[offset:offset + limit]
         content = ''.join(selected)
-        return ToolResult.ok(f"文件: {target_path}\n{'='*40}\n{content}")
+        return ToolResult.ok(f"文件: {resolved}\n{'='*40}\n{content}")
     except Exception as e:
         return ToolResult.fail(f"读取错误: {str(e)}")
 
@@ -138,12 +371,17 @@ def write_file(input_str: str) -> ToolResult:
         path, content = input_str.split('|||', 1)
         target_path = os.path.expanduser(path)
 
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        # 路径沙箱验证（写入模式）
+        allowed, resolved, reason = _validate_path(target_path, mode="write")
+        if not allowed:
+            return ToolResult.fail(f"路径访问被拒绝: {reason}")
 
-        with open(target_path, 'w', encoding='utf-8') as f:
+        os.makedirs(os.path.dirname(resolved), exist_ok=True)
+
+        with open(resolved, 'w', encoding='utf-8') as f:
             f.write(content)
 
-        return ToolResult.ok(f"文件已写入: {target_path}")
+        return ToolResult.ok(f"文件已写入: {resolved}")
     except Exception as e:
         return ToolResult.fail(f"写入错误: {str(e)}")
 
@@ -165,7 +403,20 @@ def search_files(pattern: str) -> ToolResult:
     import glob
     try:
         expanded = os.path.expanduser(pattern)
-        matches = glob.glob(expanded, recursive=True)
+
+        # 路径沙箱验证：提取目录部分进行验证
+        dir_part = os.path.dirname(expanded)
+        if not dir_part:
+            dir_part = "."
+        allowed, resolved_dir, reason = _validate_path(dir_part, mode="read")
+        if not allowed:
+            return ToolResult.fail(f"路径访问被拒绝: {reason}")
+
+        # 使用验证后的目录重建搜索模式
+        pattern_base = os.path.basename(expanded)
+        safe_pattern = os.path.join(resolved_dir, pattern_base)
+
+        matches = glob.glob(safe_pattern, recursive=True)
         if not matches:
             return ToolResult.fail(f"未找到匹配文件: {pattern}")
 

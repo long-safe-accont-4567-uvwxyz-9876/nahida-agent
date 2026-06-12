@@ -10,3 +10,11 @@ models/*.nb
 .DS_Store
 Thumbs.db
 *.log
+.venv/
+node_modules/
+web/dist/
+web/media/
+credentials/
+state/
+.trae/
+config/webui_overrides.json

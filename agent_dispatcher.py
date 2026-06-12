@@ -3,6 +3,7 @@ import json
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 from openai import AsyncOpenAI
 
 from loguru import logger
@@ -12,6 +13,83 @@ from tool_repair import ToolCallRepair
 from text_utils import has_dsml_tool_calls, parse_dsml_tool_calls, strip_dsml
 from tts_engine import TTSEngine
 from emoji_config import get_status_msg
+from tool_guardrails import get_tool_guardrails
+from credential_pool import get_credential_pool, CredentialPool
+
+
+# ── ToolCallExtractor 统一接口 ──────────────────────────────
+
+@dataclass
+class ExtractedToolCall:
+    """统一的工具调用结构，无论来源是标准 tool_calls 还是 DSML 文本。"""
+    id: str
+    name: str
+    arguments_json: str  # JSON string
+
+    def parse_arguments(self) -> dict:
+        try:
+            return json.loads(self.arguments_json)
+        except json.JSONDecodeError:
+            return {}
+
+
+@runtime_checkable
+class ToolCallExtractor(Protocol):
+    """从 LLM 响应中提取工具调用的策略接口。"""
+
+    def extract(self, message) -> list[ExtractedToolCall] | None:
+        """从 message 中提取工具调用。返回 None 表示无工具调用。"""
+        ...
+
+
+class StandardExtractor:
+    """从标准 message.tool_calls 中提取工具调用。"""
+
+    def extract(self, message) -> list[ExtractedToolCall] | None:
+        if not message.tool_calls:
+            return None
+        return [
+            ExtractedToolCall(
+                id=tc.id,
+                name=tc.function.name,
+                arguments_json=tc.function.arguments,
+            )
+            for tc in message.tool_calls
+        ]
+
+
+class DsmlExtractor:
+    """从 DSML 文本标记中提取工具调用（用于推理模型）。"""
+
+    def __init__(self, allowed_tools: set[str] | None = None):
+        self._allowed_tools = allowed_tools
+
+    def extract(self, message) -> list[ExtractedToolCall] | None:
+        content = message.content or ""
+        if not content:
+            return None
+        if not has_dsml_tool_calls(content):
+            return None
+        dsml_calls = parse_dsml_tool_calls(content, self._allowed_tools)
+        if not dsml_calls:
+            return None
+        return [
+            ExtractedToolCall(
+                id=tc["id"],
+                name=tc["function"]["name"],
+                arguments_json=tc["function"]["arguments"],
+            )
+            for tc in dsml_calls
+        ]
+
+
+# 子代理禁止使用的工具列表（借鉴 Hermes delegate_tool.py）
+DELEGATE_BLOCKED_TOOLS = {
+    "delegate_task",      # 禁止递归委托
+    "send_message",       # 禁止跨平台消息
+    "memory_write",       # 禁止共享记忆写入
+    "agnes_video_generate",  # 视频生成耗时过长
+}
 
 
 @dataclass
@@ -27,6 +105,15 @@ class SubAgentConfig:
     api_key_env: str = ""
     capabilities: list[str] = field(default_factory=list)
     route_description: str = ""
+    mcp_servers: list[str] = field(default_factory=list)
+    max_spawn_depth: int = 1  # 子代理最大嵌套深度
+    # 增强配置字段
+    max_turns: int | None = None           # 最大对话轮数
+    effort: str | None = None              # 思考努力程度: "low"/"medium"/"high"
+    permission_mode: str | None = None     # 权限模式: "default"/"dev"/"strict"
+    memory_scope: str | None = None        # 记忆作用域: "shared"/"isolated"
+    background: bool = False               # 是否后台运行
+    wallpaper: str = ""                    # 聊天背景板 URL（/assets/... 或上传后的 /media/...）
 
 
 def _read_env_key(env_var: str) -> str:
@@ -51,15 +138,18 @@ class SubAgent:
     def __init__(self, config: SubAgentConfig, tts: TTSEngine,
                  tool_executor: ToolExecutor | None = None,
                  tool_repair: ToolCallRepair | None = None,
-                 delegate_callback=None):
+                 delegate_callback=None,
+                 core=None):
         self.config = config
         self._tts = tts
         self._tool_executor = tool_executor
         self._tool_repair = tool_repair
         self._delegate_callback = delegate_callback
+        self._core = core
         self._client: AsyncOpenAI | None = None
         self._personality: str = ""
         self._initialized = False
+        self._credential_pool: CredentialPool | None = None
 
     async def init(self):
         api_key = _read_env_key(self.config.api_key_env)
@@ -74,9 +164,42 @@ class SubAgent:
         if not self._personality:
             self._personality = f"你是{self.config.display_name}。"
 
+        # effort 思考努力程度提示
+        if self.config.effort:
+            effort_hints = {
+                "low": "请简洁回答，不需要深入分析。",
+                "medium": "请适度分析后回答。",
+                "high": "请深入思考和分析后给出详细回答。",
+            }
+            hint = effort_hints.get(self.config.effort, "")
+            if hint:
+                self._personality = f"{self._personality}\n\n{hint}"
+
         self._initialized = self._client is not None
         if self._initialized:
-            logger.info("sub_agent.initialized", name=self.config.name, provider=self.config.provider, model=self.config.model)
+            # API Key 探活：发一个极短请求验证凭证有效性
+            probe_enabled = os.environ.get("SUBAGENT_PROBE_ENABLED", "on").lower() in ("on", "1", "true")
+            if probe_enabled:
+                try:
+                    await asyncio.wait_for(
+                        self._client.chat.completions.create(
+                            model=self.config.model,
+                            messages=[{"role": "user", "content": "hi"}],
+                            max_tokens=1,
+                        ),
+                        timeout=15,
+                    )
+                    logger.info("sub_agent.probe_ok", name=self.config.name)
+                except Exception as e:
+                    logger.warning("sub_agent.probe_failed", name=self.config.name, error=str(e)[:200])
+                    self._initialized = False
+                    self._client = None
+            else:
+                logger.info("sub_agent.initialized", name=self.config.name, provider=self.config.provider, model=self.config.model)
+
+    def set_credential_pool(self, pool: CredentialPool):
+        """设置凭证池（由父代理传递）"""
+        self._credential_pool = pool
 
     @property
     def available(self) -> bool:
@@ -87,8 +210,16 @@ class SubAgent:
             return None
         all_tools = to_openai_tools()
         excluded = self.config.excluded_tools
-        filtered = [t for t in all_tools if t["function"]["name"] not in excluded]
-        return filtered if filtered else None
+        tools = [t for t in all_tools if t["function"]["name"] not in excluded]
+
+        # Add MCP tools if available
+        if hasattr(self._core, '_mcp_manager') and self._core._mcp_manager:
+            mcp_server_names = self.config.mcp_servers
+            if mcp_server_names:
+                mcp_tools = self._core._mcp_manager.get_tools_for_agent(mcp_server_names)
+                tools.extend(mcp_tools)
+
+        return tools if tools else None
 
     def _filtered_tool_names(self) -> set[str]:
         if not self._tool_executor:
@@ -133,11 +264,28 @@ class SubAgent:
 
     async def _handle_tool_result(self, tool_name: str, result: ToolResult) -> str:
         result_text = ""
-        if result.success and isinstance(result.data, str) and result.data.startswith("[NAHIDA_PENDING]"):
-            question = result.data[len("[NAHIDA_PENDING]"):]
+        from core.delegation import DelegationRequest
+        delegation_req = None
+        if result.success and isinstance(result.data, DelegationRequest):
+            delegation_req = result.data
+        elif result.success and isinstance(result.data, str) and result.data.startswith("[NAHIDA_PENDING]"):
+            # 兼容旧格式
+            delegation_req = DelegationRequest(
+                type="nahida", question=result.data[len("[NAHIDA_PENDING]"):], delegator=self.config.name
+            )
+
+        if delegation_req and delegation_req.type == "nahida":
+            question = delegation_req.question
             if self._delegate_callback:
-                delegate_reply = await self._delegate_callback(question)
-                result_text = f"[主Agent的回答（{self.config.display_name}需要用自己的话转述，不要直接复制原话）]\n{delegate_reply}"
+                # 委托深度检查：超过 2 层直接返回兜底回复，防止无限循环
+                from agent_core import _current_request_ctx
+                _ctx = _current_request_ctx.get()
+                if _ctx and _ctx.delegate_depth >= 2:
+                    logger.warning("delegate.depth_exceeded", depth=_ctx.delegate_depth, from_agent=self.config.name)
+                    result_text = "纳西妲姐姐现在也在忙，先自己想想办法吧！"
+                else:
+                    delegate_reply = await self._delegate_callback(question)
+                    result_text = f"[主Agent的回答（{self.config.display_name}需要用自己的话转述，不要直接复制原话）]\n{delegate_reply}"
             else:
                 result_text = "主Agent现在不在...先自己想想办法吧！"
         elif result.success:
@@ -179,12 +327,16 @@ class SubAgent:
         return "\n".join(lines)
 
     async def _chat_loop(self, messages: list[dict], tools: list[dict] | None) -> str:
-        max_rounds = 5
+        max_rounds = self.config.max_turns if self.config.max_turns is not None else 5
         working = list(messages)
         tool_names = self._filtered_tool_names()
         api_timeout = 60
-        total_deadline = asyncio.get_event_loop().time() + 150
+        total_deadline = asyncio.get_running_loop().time() + 150
         is_reasoning = self._is_reasoning_model()
+
+        # 选择 extractor：推理模型用 DSML，否则用标准
+        standard_ext = StandardExtractor()
+        dsml_ext = DsmlExtractor(allowed_tools=tool_names)
 
         if is_reasoning and tools:
             dsml_prompt = self._build_dsml_tool_prompt()
@@ -196,17 +348,17 @@ class SubAgent:
             tools = None
 
         for round_idx in range(max_rounds):
-            if asyncio.get_event_loop().time() > total_deadline:
+            if asyncio.get_running_loop().time() > total_deadline:
                 logger.warning("sub_agent.total_timeout", name=self.config.name)
                 return f"{self.config.display_name}处理超时了，请稍后再试吧～"
 
-            remaining = total_deadline - asyncio.get_event_loop().time()
+            remaining = total_deadline - asyncio.get_running_loop().time()
             if remaining < 10:
                 logger.warning("sub_agent.time_exhausted", name=self.config.name)
                 return f"{self.config.display_name}处理超时了，请稍后再试吧～"
 
             try:
-                t0 = asyncio.get_event_loop().time()
+                t0 = asyncio.get_running_loop().time()
                 response = await asyncio.wait_for(
                     self._client.chat.completions.create(
                         model=self.config.model,
@@ -218,7 +370,7 @@ class SubAgent:
                     ),
                     timeout=min(api_timeout, remaining),
                 )
-                elapsed = asyncio.get_event_loop().time() - t0
+                elapsed = asyncio.get_running_loop().time() - t0
                 logger.info("sub_agent.api_ok", name=self.config.name, round=round_idx, elapsed=f"{elapsed:.1f}s")
             except asyncio.TimeoutError:
                 logger.warning("sub_agent.api_timeout", name=self.config.name, round=round_idx)
@@ -226,102 +378,103 @@ class SubAgent:
 
             msg = response.choices[0].message
 
-            if not msg.tool_calls:
+            # 统一提取工具调用：先尝试标准，再尝试 DSML
+            extracted = standard_ext.extract(msg)
+            is_dsml = False
+            if extracted is None and self._tool_executor:
+                extracted = dsml_ext.extract(msg)
+                is_dsml = extracted is not None
+
+            if extracted is None:
                 content = msg.content or ""
                 if not content:
                     rc = getattr(msg, "reasoning_content", None) or ""
                     if rc:
                         content = rc
-
-                if tools and self._tool_executor and has_dsml_tool_calls(content):
-                    dsml_calls = parse_dsml_tool_calls(content, tool_names)
-                    if not dsml_calls:
-                        logger.warning("sub_agent.dsml_parse_failed", name=self.config.name)
-                        logger.info("sub_agent.chat.ok", name=self.config.name, model=self.config.model, rounds=round_idx)
-                        return content.strip()
-                    clean_content = strip_dsml(content)
-                    msg_rc = getattr(msg, "reasoning_content", None) or ""
-                    assistant_msg = {
-                        "role": "assistant",
-                        "content": clean_content,
-                        "tool_calls": dsml_calls,
-                    }
-                    if msg_rc:
-                        assistant_msg["reasoning_content"] = msg_rc
-                    working.append(assistant_msg)
-
-                    for tc in dsml_calls:
-                        tool_name = tc["function"]["name"]
-                        args_str = tc["function"]["arguments"]
-
-                        if self._tool_repair:
-                            repaired = self._tool_repair.repair_truncation(args_str)
-                            if repaired:
-                                args_str = repaired
-
-                        try:
-                            args = json.loads(args_str)
-                        except json.JSONDecodeError:
-                            args = {}
-
-                        result = await self._tool_executor.execute(tool_name, args)
-                        result_text = await self._handle_tool_result(tool_name, result)
-
-                        working.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": result_text,
-                        })
-
-                        continue
-
                 logger.info("sub_agent.chat.ok", name=self.config.name, model=self.config.model, rounds=round_idx)
                 return content.strip()
 
+            # 构造 assistant 消息
             msg_rc = getattr(msg, "reasoning_content", None) or ""
-            assistant_msg = {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ],
-            }
+            if is_dsml:
+                clean_content = strip_dsml(msg.content or "")
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": clean_content,
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments_json}}
+                        for tc in extracted
+                    ],
+                }
+            else:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": msg.content or "",
+                    "tool_calls": [
+                        {"id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments_json}}
+                        for tc in extracted
+                    ],
+                }
             if msg_rc:
                 assistant_msg["reasoning_content"] = msg_rc
             working.append(assistant_msg)
 
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                args_str = tc.function.arguments
+            # 统一执行工具调用
+            async def _exec_one(tc: ExtractedToolCall):
+                tool_name = tc.name
+                args_str = tc.arguments_json
 
                 if self._tool_repair:
                     repaired = self._tool_repair.repair_truncation(args_str)
                     if repaired:
                         args_str = repaired
 
-                try:
-                    args = json.loads(args_str)
-                except json.JSONDecodeError:
-                    args = {}
+                args = tc.parse_arguments()
+
+                # 过滤被禁止的工具
+                if tool_name in DELEGATE_BLOCKED_TOOLS:
+                    tool_result_content = json.dumps({
+                        "error": f"工具 {tool_name} 在子代理中被禁止使用"
+                    }, ensure_ascii=False)
+                    return {"tool_call_id": tc.id, "content": tool_result_content}
+
+                # 工具护栏检查
+                guardrails = get_tool_guardrails()
+                action, guard_msg = await guardrails.check(tool_name, args)
+                if action == "halt":
+                    return {"tool_call_id": tc.id, "content": f"错误: {guard_msg}"}
 
                 result = await self._tool_executor.execute(tool_name, args)
+
+                # 记录工具调用到护栏
+                await guardrails.record_call(tool_name, args, result.success,
+                                       str(result.data)[:100] if result.data else "")
+
                 result_text = await self._handle_tool_result(tool_name, result)
 
-                working.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_text,
-                })
+                # 护栏警告注入
+                if action == "warn" and guard_msg and result.success:
+                    result_text = f"[护栏警告: {guard_msg}]\n{result_text}"
 
-        remaining = total_deadline - asyncio.get_event_loop().time()
+                return {"tool_call_id": tc.id, "content": result_text}
+
+            tool_results = await asyncio.gather(*[_exec_one(tc) for tc in extracted], return_exceptions=True)
+            for tc, r in zip(extracted, tool_results):
+                if isinstance(r, Exception):
+                    logger.warning("sub_agent.tool_error", name=self.config.name, tool=tc.name, error=str(r))
+                    working.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": f"错误: {r}",
+                    })
+                else:
+                    working.append({
+                        "role": "tool",
+                        "tool_call_id": r["tool_call_id"],
+                        "content": r["content"],
+                    })
+
+        remaining = total_deadline - asyncio.get_running_loop().time()
         if remaining < 5:
             return f"{self.config.display_name}现在有点累了...等会儿再来吧！💤"
 
@@ -359,21 +512,23 @@ class SubAgent:
                 return raw_content
             return f"{self.config.display_name}现在有点累了...等会儿再来吧！💤"
 
-    async def synthesize(self, text: str, style: str = "") -> Path | None:
+    async def synthesize(self, text: str, style: str = "", emotion: str = "") -> Path | None:
         if not self.config.voice_ref:
             return None
-        return await self._tts.synthesize(text, voice=self.config.voice_ref, style=style)
+        return await self._tts.synthesize(text, voice=self.config.voice_ref, style=style, emotion=emotion)
 
 
 class AgentDispatcher:
     def __init__(self, tts: TTSEngine,
                  tool_executor: ToolExecutor | None = None,
                  tool_repair: ToolCallRepair | None = None,
-                 delegate_callback=None):
+                 delegate_callback=None,
+                 core=None):
         self._tts = tts
         self._tool_executor = tool_executor
         self._tool_repair = tool_repair
         self._delegate_callback = delegate_callback
+        self._core = core
         self._agents: dict[str, SubAgent] = {}
 
     async def register(self, config: SubAgentConfig) -> bool:
@@ -387,6 +542,7 @@ class AgentDispatcher:
             tool_executor=self._tool_executor,
             tool_repair=self._tool_repair,
             delegate_callback=self._delegate_callback,
+            core=self._core,
         )
         await agent.init()
 

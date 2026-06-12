@@ -1,0 +1,153 @@
+<script setup lang="ts">
+import { onMounted, computed } from 'vue'
+import { useChatStore } from '../../stores/chat'
+import { useAgentsStore } from '../../stores/agents'
+import EmotionAvatar from '../chat/EmotionAvatar.vue'
+
+const chat = useChatStore()
+const agentsStore = useAgentsStore()
+
+onMounted(() => {
+  if (!agentsStore.agents.length) agentsStore.load().catch(() => {})
+})
+
+const enabledAgents = computed(() =>
+  agentsStore.agents.filter(a => a.enabled))
+
+const stageText: Record<string, string> = {
+  thinking: '🌿 正在思考...',
+  tool: '🛠 正在使用工具...',
+  replying: '✍️ 正在回复...',
+}
+</script>
+
+<template>
+  <header class="topbar">
+    <div class="agent-switcher">
+      <button
+        v-for="a in enabledAgents"
+        :key="a.name"
+        class="agent-chip"
+        :class="{ active: chat.currentAgent === a.name }"
+        :title="`${a.display_name} · ${a.model || a.provider} · ${a.tool_count ?? '?'} 个工具`"
+        @click="chat.setAgent(a.name)"
+      >
+        <span class="chip-avatar"
+              :style="a.wallpaper ? { backgroundImage: `url('${a.wallpaper}')` } : undefined">
+          <template v-if="!a.wallpaper">{{ a.display_name.slice(0, 1) }}</template>
+        </span>
+        <span class="chip-name">{{ a.display_name }}</span>
+      </button>
+    </div>
+
+    <div v-if="chat.isProcessing" class="stage-indicator">
+      {{ chat.statusText || stageText[chat.currentStage] || '🌿 处理中...' }}
+    </div>
+
+    <div class="topbar-right">
+      <EmotionAvatar />
+      <span class="status-dot" :class="chat.wsConnected ? 'green' : 'red'"
+            :title="chat.wsConnected ? '已连接' : '连接中断，重连中…'"></span>
+    </div>
+  </header>
+</template>
+
+<style scoped>
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px;
+  height: var(--topbar-height);
+  background: rgba(15, 31, 23, 0.55);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--glass-border);
+  flex-shrink: 0;
+}
+
+.agent-switcher {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+}
+
+.agent-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 4px 4px;
+  background: rgba(20, 40, 28, 0.5);
+  border: 1px solid var(--glass-border);
+  border-radius: 18px;
+  color: var(--moon-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: transform 0.2s var(--ease-out), border-color 0.2s, box-shadow 0.2s;
+  transform-style: preserve-3d;
+}
+
+.agent-chip:hover {
+  transform: perspective(400px) translateZ(6px) rotateX(-4deg);
+  border-color: rgba(127, 214, 80, 0.4);
+}
+
+.agent-chip.active {
+  border-color: var(--dendro);
+  color: var(--dendro);
+  box-shadow: 0 0 12px rgba(127, 214, 80, 0.25);
+  transform: perspective(400px) translateZ(8px);
+}
+
+.chip-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: rgba(127, 214, 80, 0.18) center/cover no-repeat;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.chip-name { font-size: 13px; }
+
+.stage-indicator {
+  font-size: 13px;
+  color: var(--wisdom);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  animation: breathe 2s ease-in-out infinite;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+.status-dot.green { background: var(--dendro); box-shadow: 0 0 8px var(--dendro); }
+.status-dot.red { background: var(--alert); box-shadow: 0 0 8px var(--alert); }
+
+@keyframes breathe {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+@media (max-width: 768px) {
+  .chip-name { display: none; }
+  .stage-indicator { display: none; }
+}
+</style>

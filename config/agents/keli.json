@@ -1,0 +1,38 @@
+{
+  "name": "keli",
+  "display_name": "可莉",
+  "provider": "mimo",
+  "model": "mimo-v2.5-pro",
+  "personality_file": "/home/orangepi/ai-agent/klee_personality.md",
+  "voice_ref": "keli",
+  "excluded_tools": [
+    "call_klee",
+    "document_reader",
+    "list_files",
+    "multi_search",
+    "python_executor",
+    "read_file",
+    "search_files",
+    "web_browse",
+    "wolfram_query",
+    "write_file"
+  ],
+  "base_url": "https://api.xiaomimimo.com/v1",
+  "api_key_env": "MIMO_API_KEY",
+  "capabilities": [
+    "chat",
+    "play",
+    "fun"
+  ],
+  "route_description": "日常聊天、玩耍、轻松有趣的对话",
+  "mcp_servers": [],
+  "max_spawn_depth": 1,
+  "max_turns": null,
+  "effort": null,
+  "permission_mode": null,
+  "memory_scope": null,
+  "background": false,
+  "wallpaper": "",
+  "_saved_at": 1781246761.7828388,
+  "_disabled": false
+}

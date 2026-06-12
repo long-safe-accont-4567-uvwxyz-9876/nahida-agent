@@ -1,0 +1,198 @@
+"""健康测试中心路由（R12）：LLM/TTS/视频/MCP/DB/向量 探针、系统信息、报告。"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from loguru import logger
+
+from web.schemas import Envelope
+from web.routers.auth import get_current_user
+
+router = APIRouter(tags=["health"], dependencies=[Depends(get_current_user)])
+
+_all_running = False
+
+
+@router.get("/health/probes", response_model=Envelope[list[dict]])
+async def list_probes(request: Request):
+    from web.probes import list_probe_ids
+    return Envelope(data=list_probe_ids(request.app.state.core))
+
+
+@router.post("/health/test/llm", response_model=Envelope[dict])
+async def test_llm(body: dict, request: Request):
+    from web.probes import probe_llm
+    core = request.app.state.core
+    provider_id = body.get("provider_id")
+    if provider_id:
+        return Envelope(data=await _probe_provider(request, provider_id))
+    return Envelope(data=await probe_llm(core, body.get("route", "chat")))
+
+
+async def _probe_provider(request: Request, provider_id: str) -> dict:
+    """对自定义 provider 直连探活（不经过 ROUTE_TABLE）。"""
+    from web.config_service import get_config_service
+    from web.routers.models import load_provider_key
+    from web.custom_providers import build_client
+    cfg = get_config_service()
+    t0 = time.time()
+    if provider_id in ("mimo", "agnes"):
+        from web.probes import probe_llm
+        route = "chat" if provider_id == "mimo" else "chat_agnes"
+        return await probe_llm(request.app.state.core, route)
+    record = cfg.get(f"models.providers.{provider_id}")
+    if not record:
+        return {"ok": False, "error": f"provider {provider_id} 不存在", "latency_ms": 0}
+    key = load_provider_key(provider_id)
+    if not key:
+        return {"ok": False, "error": "未配置 API Key", "latency_ms": 0}
+    model = record.get("default_model") or ""
+    if not model:
+        return {"ok": False, "error": "未配置 default_model", "latency_ms": 0}
+    try:
+        client = build_client(record.get("format", "openai"), record["base_url"], key)
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "请只回复四个字：草元素已就绪"}],
+                max_tokens=30),
+            timeout=30)
+        text = resp.choices[0].message.content or ""
+        return {"ok": bool(text.strip()), "latency_ms": int((time.time() - t0) * 1000),
+                "model": model, "reply_excerpt": text[:60],
+                "error": "" if text.strip() else "空回复"}
+    except Exception as e:
+        return {"ok": False, "latency_ms": int((time.time() - t0) * 1000),
+                "model": model, "error": str(e)[:200]}
+
+
+@router.post("/health/test/tts", response_model=Envelope[dict])
+async def test_tts(request: Request):
+    from web.probes import probe_tts
+    return Envelope(data=await probe_tts(request.app.state.core))
+
+
+@router.post("/health/test/video", response_model=Envelope[dict])
+async def test_video(request: Request):
+    from web.probes import probe_video_config
+    return Envelope(data=await probe_video_config())
+
+
+@router.post("/health/test/mcp/{server}", response_model=Envelope[dict])
+async def test_mcp(server: str, request: Request):
+    from web.probes import probe_mcp
+    return Envelope(data=await probe_mcp(request.app.state.core, server))
+
+
+@router.post("/health/test/{probe_id:path}", response_model=Envelope[dict])
+async def test_one(probe_id: str, request: Request):
+    from web.probes import run_probe
+    return Envelope(data=await run_probe(request.app.state.core, probe_id))
+
+
+@router.post("/health/test-all", response_model=Envelope[dict])
+async def test_all(request: Request):
+    """一键全检：后台串行执行，逐项进度走 WS health_progress。"""
+    global _all_running
+    if _all_running:
+        raise HTTPException(409, "全量自检已在进行中")
+    core = request.app.state.core
+
+    async def _run():
+        global _all_running
+        _all_running = True
+        try:
+            from web.probes import run_all
+            from web.ws_hub import manager
+
+            async def on_progress(item_id: str, res: dict):
+                await manager.broadcast({
+                    "type": "health_progress", "item": item_id,
+                    "ok": res.get("ok", False),
+                    "detail": res.get("error") or res.get("reply_excerpt") or "",
+                    "latency_ms": res.get("latency_ms", 0),
+                })
+
+            report = await run_all(core, on_progress=on_progress)
+            await manager.broadcast({
+                "type": "health_done",
+                "passed": report["passed"], "total": report["total"],
+            })
+        except Exception as e:
+            logger.warning("health.run_all_failed error={}", str(e))
+        finally:
+            _all_running = False
+
+    asyncio.create_task(_run())
+    return Envelope(data={"started": True})
+
+
+@router.get("/health/report", response_model=Envelope[dict])
+async def last_report(request: Request):
+    core = request.app.state.core
+    row = await core.db.fetch_one(
+        "SELECT * FROM health_reports ORDER BY run_at DESC LIMIT 1")
+    if not row:
+        return Envelope(data={})
+    try:
+        row["detail"] = json.loads(row["detail"])
+    except Exception:
+        pass
+    return Envelope(data=row)
+
+
+@router.get("/health/system", response_model=Envelope[dict])
+async def system_info():
+    data: dict = {"timestamp": time.time()}
+    try:
+        load1, load5, load15 = os.getloadavg()
+        data["load"] = [load1, load5, load15]
+        data["cpu_count"] = os.cpu_count()
+    except OSError:
+        pass
+    try:
+        meminfo = Path("/proc/meminfo").read_text()
+        mem = {}
+        for line in meminfo.splitlines()[:5]:
+            k, v = line.split(":", 1)
+            mem[k.strip()] = int(v.strip().split()[0]) * 1024
+        data["mem_total"] = mem.get("MemTotal", 0)
+        data["mem_available"] = mem.get("MemAvailable", 0)
+    except Exception:
+        pass
+    try:
+        st = os.statvfs("/")
+        data["disk_total"] = st.f_blocks * st.f_frsize
+        data["disk_free"] = st.f_bavail * st.f_frsize
+    except Exception:
+        pass
+    temps = []
+    try:
+        for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+            try:
+                t = int((zone / "temp").read_text().strip()) / 1000.0
+                name = (zone / "type").read_text().strip()
+                temps.append({"zone": name, "temp_c": round(t, 1)})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    data["temperatures"] = temps
+    try:
+        data["uptime"] = float(Path("/proc/uptime").read_text().split()[0])
+    except Exception:
+        pass
+    try:
+        status = Path("/proc/self/status").read_text()
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                data["process_rss"] = int(line.split()[1]) * 1024
+                break
+    except Exception:
+        pass
+    return Envelope(data=data)

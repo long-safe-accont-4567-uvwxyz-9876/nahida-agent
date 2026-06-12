@@ -36,6 +36,13 @@ MIMO_API_KEY = os.getenv("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")
 MIMO_MODEL = os.getenv("MIMO_MODEL_NAME", "mimo-v2.5")
 
+# Agnes AI 配置
+AGNES_API_KEY = os.getenv("AGNES_API_KEY", "")
+AGNES_BASE_URL = os.getenv("AGNES_BASE_URL", "https://apihub.agnes-ai.com/v1")
+AGNES_TEXT_MODEL = os.getenv("AGNES_TEXT_MODEL", "agnes-2.0-flash")
+AGNES_IMAGE_MODEL = os.getenv("AGNES_IMAGE_MODEL", "agnes-image-2.1-flash")
+AGNES_VIDEO_MODEL = os.getenv("AGNES_VIDEO_MODEL", "agnes-video-v2.0")
+
 
 def _strip_json5_comments(text: str) -> str:
     result = []
@@ -97,22 +104,51 @@ def load_workspace_file(filename: str) -> str:
 
 _SYSTEM_PROMPT_CACHE: str = ""
 _SYSTEM_PROMPT_CACHE_TS: float = 0.0
-_SYSTEM_PROMPT_CACHE_TTL: float = 5.0
+_SYSTEM_PROMPT_CACHE_TTL: float = 60.0
+_SYSTEM_PROMPT_CACHE_MTIMES: dict[str, float] = {}
+
+def _get_workspace_mtimes() -> dict[str, float]:
+    mtimes = {}
+    for name in ("AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md", "TOOLS.md", "MEMORY.md", "HEARTBEAT.md"):
+        filepath = WORKSPACE_DIR / name
+        try:
+            mtimes[name] = filepath.stat().st_mtime
+        except OSError:
+            mtimes[name] = 0.0
+    skills_dir = WORKSPACE_DIR / "skills"
+    if skills_dir.is_dir():
+        for fp in skills_dir.glob("*.md"):
+            try:
+                mtimes[f"skills/{fp.name}"] = fp.stat().st_mtime
+            except OSError:
+                pass
+    return mtimes
+
+
+def load_skills() -> list[dict]:
+    """workspace/skills/*.md → [{name, content}]，按文件名排序。"""
+    skills_dir = WORKSPACE_DIR / "skills"
+    out = []
+    if skills_dir.is_dir():
+        for fp in sorted(skills_dir.glob("*.md")):
+            try:
+                out.append({"name": fp.stem,
+                            "content": fp.read_text(encoding="utf-8").strip()})
+            except OSError:
+                pass
+    return out
 
 def build_system_prompt(extra_context: str = "") -> str:
-    global _SYSTEM_PROMPT_CACHE, _SYSTEM_PROMPT_CACHE_TS
+    global _SYSTEM_PROMPT_CACHE, _SYSTEM_PROMPT_CACHE_TS, _SYSTEM_PROMPT_CACHE_MTIMES
 
     now = time.time()
-    if _SYSTEM_PROMPT_CACHE and (now - _SYSTEM_PROMPT_CACHE_TS) < _SYSTEM_PROMPT_CACHE_TTL:
+    current_mtimes = _get_workspace_mtimes()
+    mtime_changed = current_mtimes != _SYSTEM_PROMPT_CACHE_MTIMES
+
+    if _SYSTEM_PROMPT_CACHE and (now - _SYSTEM_PROMPT_CACHE_TS) < _SYSTEM_PROMPT_CACHE_TTL and not mtime_changed:
         system_prompt = _SYSTEM_PROMPT_CACHE
     else:
-        from datetime import datetime
-        current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M") + " (北京时间)"
-
         sections = []
-
-        time_section = f"[当前时间] {current_time}"
-        sections.append(time_section)
 
         agents_rules = load_workspace_file("AGENTS.md")
         if agents_rules:
@@ -142,6 +178,14 @@ def build_system_prompt(extra_context: str = "") -> str:
         if heartbeat:
             sections.append(heartbeat)
 
+        skills = load_skills()
+        if skills:
+            skill_texts = "\n\n".join(
+                f"### Skill: {s['name']}\n{s['content']}" for s in skills if s["content"])
+            if skill_texts:
+                sections.append("[已安装的 Skills]\n\n" + skill_texts)
+
+        _npu_status = "NPU视觉识别已启用" if os.getenv("ENABLE_NPU", "").lower() in ("1", "true", "yes") else "视觉识别（ncnn后端）"
         hw_context = (
             "[香橙派硬件信息]\n"
             "板卡: Orange Pi 4 Pro | SoC: 全志 T507 | 架构: ARMv8 (6×A55 + 2×A76 big.LITTLE)\n"
@@ -149,7 +193,7 @@ def build_system_prompt(extra_context: str = "") -> str:
             "可用接口: GPIO (40pin排针) / I2C / SPI / UART / PWM\n"
             "可用工具: gpio_control(引脚控制) / i2c_comm(I2C通信) / hardware_status(硬件监控) / service_manage(服务管理) / network_diag(网络诊断) / dev_assist(开发辅助) / camera_capture(拍照) / vision_analyze(视觉分析)\n"
             "数据存储: KIOXIA 外挂存储 (/media/orangepi/KIOXIA/nahida-data/)\n"
-            "摄像头: Q8 HD Webcam (/dev/video0) | 视觉模型: YOLOv10-nano (ncnn CPU) | NPU视觉识别已禁用"
+            f"摄像头: Q8 HD Webcam (/dev/video0) | 视觉模型: YOLOv10-nano (ncnn CPU) | {_npu_status}"
         )
         sections.append(hw_context)
 
@@ -157,6 +201,7 @@ def build_system_prompt(extra_context: str = "") -> str:
 
         _SYSTEM_PROMPT_CACHE = system_prompt
         _SYSTEM_PROMPT_CACHE_TS = now
+        _SYSTEM_PROMPT_CACHE_MTIMES = current_mtimes
 
     if extra_context:
         system_prompt += f"\n\n---\n\n{extra_context}"
@@ -165,6 +210,90 @@ def build_system_prompt(extra_context: str = "") -> str:
 
 
 AGENT_CONFIG = load_agent_config()
+
+# ── 路由关键词常量 ──────────────────────────────────────────────
+# 用于 _is_simple_task：包含这些关键词的消息视为复杂任务
+SIMPLE_TASK_KEYWORDS = {
+    "complex": [
+        "搜索", "查一下", "帮我查", "找一下", "搜一下", "查查", "帮我找",
+        "搜索一下", "查资料", "搜资料", "写代码", "编程", "调试",
+        "研究", "分析", "计算", "执行", "运行", "安装", "部署",
+        "翻译", "转换", "制作", "设计",
+        "怎么看", "怎么弄", "如何", "怎么办", "帮我看", "帮我看看",
+        "检查", "巡检", "测试", "优化", "修复", "bug", "报错",
+        "画", "生成图", "生成视频", "做视频", "画一张", "画个", "画一个",
+        "图片", "视频", "图像", "插画", "海报", "封面",
+        "文生图", "图生图", "文生视频",
+    ],
+    "chat": [
+        "这是", "那是", "这个是", "那个是", "不是", "不对", "错了",
+        "你好", "谢谢", "晚安", "早安", "早上好", "晚上好",
+        "哈哈", "嘿嘿", "嗯嗯", "好的", "好吧", "算了",
+        "你知道吗", "告诉你", "跟你说", "我说",
+    ],
+}
+
+# 用于 _should_escalate_to_pro：触发升级到 pro 模型的关键词
+PRO_TASK_KEYWORDS = {
+    "tool": {"天气", "温度", "下雨", "搜索", "查一下", "帮我查",
+             "你还记得", "写代码", "调试", "执行", "计算"},
+    "negative": {"难过", "伤心", "崩溃", "绝望", "痛苦", "焦虑", "害怕",
+                 "孤独", "想哭", "受不了"},
+}
+
+# 用于 RouterNode._rule_route：按 Agent 分配的路由关键词
+AGENT_ROUTE_KEYWORDS = {
+    "xilian": [
+        "搜索", "搜一下", "查一下", "找一下", "帮我查", "帮我搜", "搜索一下",
+        "查资料", "最新", "新闻", "资讯", "获取网上", "看看有没有",
+    ],
+    "yinlang": [
+        "代码", "编程", "写代码", "debug", "调试", "程序", "开发", "部署",
+        "git", "api", "接口", "函数", "脚本", "运行", "执行命令",
+        "巡检", "检查系统", "磁盘", "内存", "cpu", "进程", "服务状态",
+        "日志", "监控", "系统信息", "香橙派", "orange pi", "服务器",
+        "docker", "容器", "网络", "端口", "防火墙", "配置文件",
+        "gpio", "i2c", "spi", "传感器", "led", "舵机", "硬件", "引脚",
+        "串口", "uart", "pwm", "adc", "dac",
+        "摄像头", "拍照", "看看", "观察", "识别", "检测",
+        "重启服务", "部署", "服务状态", "系统服务",
+        "重启", "服务",
+    ],
+    "nike": [
+        "研究", "分析", "学术", "论文", "深度", "计算复杂度", "数学证明",
+        "物理", "化学", "生物", "统计", "推导", "公式",
+    ],
+    "nahida": [
+        "天气", "气温", "温度", "下雨", "晴天", "阴天",
+        "时间", "几点", "现在几点", "日期", "今天星期几",
+        "翻译", "意思是什么",
+        "语音", "声音", "说话", "朗读", "念给我", "读给我", "听你", "听听", "发语音", "生成语音", "语音回复", "说给我听", "念出来", "tts", "voice",
+        "技能", "能力", "功能", "你会什么", "你能做什么", "你有什么", "列出技能", "列出功能",
+        "画", "生成图", "生成图片", "画一张", "画个", "画一个", "图片生成", "做视频", "生成视频",
+        "表情包", "贴纸",
+    ],
+    "parallel_trigger": [
+        "全面", "整体", "综合", "各个方面", "多方面", "同时",
+        "全部", "一起", "都检查", "都搜一下", "分别",
+        "全方位", "彻底", "完整", "所有", "各个板块",
+        "巡检", "体检", "诊断", "健康检查", "状况报告",
+    ],
+}
+
+MCP_SERVERS = {
+    "git": {
+        "command": "/home/orangepi/.local/bin/uvx",
+        "args": ["mcp-server-git", "--repository", "/home/orangepi/Desktop"],
+        "env": {"UV_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple"},
+        "agents": ["yinlang"],  # which agents can use this MCP server's tools
+    },
+    "github": {
+        "command": "/home/orangepi/.trae-cn-server/binaries/node/versions/22.22.3/bin/npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "")},
+        "agents": ["yinlang"],
+    },
+}
 
 __all__ = [
     "DEEPSEEK_API_KEY",
@@ -181,4 +310,13 @@ __all__ = [
     "build_system_prompt",
     "load_agent_config",
     "load_workspace_file",
+    "SIMPLE_TASK_KEYWORDS",
+    "PRO_TASK_KEYWORDS",
+    "AGENT_ROUTE_KEYWORDS",
+    "MCP_SERVERS",
+    "AGNES_API_KEY",
+    "AGNES_BASE_URL",
+    "AGNES_TEXT_MODEL",
+    "AGNES_IMAGE_MODEL",
+    "AGNES_VIDEO_MODEL",
 ]

@@ -22,7 +22,7 @@ PROVIDERS = [
 
 TIRED_MSG = "可莉现在有点累了...等会儿再来找大哥哥玩吧！蹦蹦...💤"
 
-EXCLUDED_TOOLS = {"call_klee"}
+EXCLUDED_TOOLS = {"call_klee", "delegate_task"}
 
 
 def _klee_tools() -> list[dict]:
@@ -156,8 +156,18 @@ class KleeAgent:
 
     async def _handle_tool_result(self, tool_name: str, result: ToolResult) -> str:
         result_text = ""
-        if result.success and isinstance(result.data, str) and result.data.startswith("[NAHIDA_PENDING]"):
-            question = result.data[len("[NAHIDA_PENDING]"):]
+        from core.delegation import DelegationRequest
+        delegation_req = None
+        if result.success and isinstance(result.data, DelegationRequest):
+            delegation_req = result.data
+        elif result.success and isinstance(result.data, str) and result.data.startswith("[NAHIDA_PENDING]"):
+            # 兼容旧格式
+            delegation_req = DelegationRequest(
+                type="nahida", question=result.data[len("[NAHIDA_PENDING]"):], delegator="klee"
+            )
+
+        if delegation_req and delegation_req.type == "nahida":
+            question = delegation_req.question
             if self._nahida_delegate:
                 logger.info("klee.calling_nahida", question=question[:50])
                 nahida_reply = await self._nahida_delegate(question)

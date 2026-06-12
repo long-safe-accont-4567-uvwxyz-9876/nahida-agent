@@ -1,9 +1,17 @@
 import os
 import time
+import asyncio
+import contextvars
 from openai import AsyncOpenAI
 from loguru import logger
 
 from db_analytics import AnalyticsDB
+from metrics import metrics
+from config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_TEXT_MODEL
+from transports import ProviderTransport, MiMoTransport, AgnesTransport
+from prompt_caching import apply_cache_control
+from error_classifier import ErrorClassifier, ClassifiedError, RecoveryAction
+from credential_pool import get_credential_pool, CredentialPool
 
 
 MIMO_MODEL = os.getenv("MIMO_MODEL_NAME", "mimo-v2.5")
@@ -26,31 +34,59 @@ MIMO_PRICING = {
 
 ROUTE_TABLE = {
     "chat": {"model": MIMO_MODEL, "max_tokens": 1500, "client": "mimo"},
-    "chat_pro": {"model": MIMO_PRO_MODEL, "max_tokens": 2000, "client": "mimo"},
+    "chat_pro": {"model": MIMO_PRO_MODEL, "max_tokens": 2000, "client": "mimo", "thinking": {"type": "enabled", "budget_tokens": 2048}},
     "chat_flash": {"model": MIMO_MODEL, "max_tokens": 1000, "client": "mimo"},
+    "chat_mini": {"model": MIMO_MODEL, "max_tokens": 800, "client": "mimo"},
     "chat_mimo": {"model": MIMO_MODEL, "max_tokens": 1500, "client": "mimo"},
     "emotion_analysis": {"model": MIMO_MODEL, "max_tokens": 300, "client": "mimo"},
     "tool_result_wrap": {"model": MIMO_MODEL, "max_tokens": 300, "client": "mimo"},
     "memory_encoding": {"model": MIMO_MODEL, "max_tokens": 800, "client": "mimo"},
+    "chat_agnes": {"model": AGNES_TEXT_MODEL, "max_tokens": 2000, "client": "agnes"},
 }
 
 MODEL_PREFERENCES = {
     "mimo": {"label": "MiMo 模式", "desc": "使用小米 MiMo-V2.5 模型"},
     "mimo-pro": {"label": "MiMo Pro 模式", "desc": "使用小米 MiMo-V2.5-Pro 深度思考"},
+    "mimo-flash": {"label": "MiMo Flash 模式", "desc": "使用小米 MiMo-V2.5 快速响应"},
+    "mimo-mini": {"label": "MiMo Mini 模式", "desc": "使用小米 MiMo-V2.5 轻量任务"},
 }
+
+RETRYABLE_ERRORS = {'timeout', 'rate_limit', 'connection_error'}
+MAX_RETRIES = 2
+FALLBACK_ROUTE = {
+    "chat_pro": "chat_flash",
+    "chat_flash": "chat_mini",
+    "chat_mini": "chat_agnes",
+}
+
+# 请求级隔离的 reasoning_content，避免并发请求间共享状态
+_reasoning_content_var = contextvars.ContextVar('reasoning_content', default='')
 
 
 class ModelRouter:
 
+    TASK_TIMEOUTS = {
+        "emotion_analysis": 10,
+        "emotion": 10,
+        "chat_flash": 15,
+        "chat": 30,
+        "chat_pro": 45,
+        "tool_call": 30,
+        "image_gen": 60,
+    }
+
     def __init__(self, api_key: str | None = None, base_url: str | None = None,
                  api_key_2: str | None = None, db=None):
         self._client = AsyncOpenAI(api_key=MIMO_API_KEY, base_url=MIMO_BASE_URL) if MIMO_API_KEY else None
+        self._agnes_client = AsyncOpenAI(api_key=AGNES_API_KEY, base_url=AGNES_BASE_URL) if AGNES_API_KEY else None
         self._db = db
         self._model_preference = "mimo"
         self._cost_buffer: list[dict] = []
         self._cost_flush_threshold = 3
         self._last_cache_warning = 0.0
-        self._last_reasoning_content: str | None = None
+        self._error_classifier = ErrorClassifier()
+        self._credential_pool = get_credential_pool()
+        self._credential_lock = asyncio.Lock()
 
         self._cache_stats = {
             "total_calls": 0,
@@ -58,9 +94,26 @@ class ModelRouter:
             "miss_tokens": 0,
         }
 
+        self._transports: dict[str, ProviderTransport] = {}
+        mimo = MiMoTransport()
+        if mimo.is_available():
+            self._transports["mimo"] = mimo
+        agnes = AgnesTransport()
+        if agnes.is_available():
+            self._transports["agnes"] = agnes
+        logger.info("router.transports", available=list(self._transports.keys()))
+
     def set_db(self, db, analytics: AnalyticsDB | None = None):
         self._db = db
         self._analytics = analytics
+
+    def list_transports(self) -> list[str]:
+        """返回所有可用 transport 名称"""
+        return list(self._transports.keys())
+
+    def get_transport(self, provider: str) -> ProviderTransport | None:
+        """获取指定提供商的 Transport"""
+        return self._transports.get(provider)
 
     def set_model_preference(self, preference: str) -> bool:
         if preference in MODEL_PREFERENCES:
@@ -78,6 +131,10 @@ class ModelRouter:
     def resolve_task_type(self, base_task: str) -> str:
         if self._model_preference == "mimo-pro":
             return "chat_pro"
+        if self._model_preference == "mimo-flash":
+            return "chat_flash"
+        if self._model_preference == "mimo-mini":
+            return "chat_mini"
         return base_task
 
     def _calc_cost(self, prompt_tokens: int, completion_tokens: int,
@@ -145,56 +202,220 @@ class ModelRouter:
                     stream: bool = False,
                     tools: list[dict] | None = None,
                     tool_choice: str | None = None,
-                    timeout: int = 60,
+                    timeout: int | None = None,
                     user_openid: str = "",
                     session_id: str = "") -> str | object:
         config = ROUTE_TABLE.get(task_type, ROUTE_TABLE["chat"])
         model = config["model"]
         mt = max_tokens or config.get("max_tokens", 1500)
+        if timeout is None:
+            timeout = self.TASK_TIMEOUTS.get(task_type, 30)
 
         self._cache_stats["total_calls"] += 1
 
+        _start = time.time()
         try:
-            client = self._client
-            if not client:
-                raise RuntimeError("MiMo client not initialized, check MIMO_API_KEY")
-
-            kwargs = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": mt,
-                "stream": stream,
-            }
-            if tools:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = tool_choice or "auto"
-
-            response = await client.chat.completions.create(**kwargs)
-
-            if stream:
-                return response
-
-            self._track_cache(response)
-            await self._record_usage(task_type, model, response, user_openid, session_id)
-            self._check_cache_health()
-
-            if tools and response.choices[0].message.tool_calls:
-                self._last_reasoning_content = getattr(response.choices[0].message, "reasoning_content", None) or None
-                return response
-
-            content = response.choices[0].message.content or ""
-            rc = getattr(response.choices[0].message, "reasoning_content", None) or ""
-            self._last_reasoning_content = rc if rc else None
-            if not content:
-                if rc:
-                    content = rc
-            return content
-
+            result = await self._route_with_retry(
+                task_type, config, messages, temperature, mt, stream,
+                tools, tool_choice, timeout, user_openid, session_id,
+            )
+            metrics.inc(f"model_route.{task_type}.success")
+            metrics.observe(f"model_route.{task_type}.duration", time.time() - _start)
+            metrics.maybe_report()
+            return result
         except Exception as e:
-            logger.error("router.call_failed", task=task_type, model=model,
-                         error=f"{type(e).__name__}: {e}")
+            metrics.inc(f"model_route.{task_type}.failure")
+            metrics.observe(f"model_route.{task_type}.duration", time.time() - _start)
+            metrics.maybe_report()
+            # fallback 逻辑：当首选模型失败时，尝试降级到更便宜的模型
+            fallback_type = FALLBACK_ROUTE.get(task_type)
+            if fallback_type:
+                fallback_config = ROUTE_TABLE.get(fallback_type)
+                if fallback_config:
+                    logger.warning("router.fallback",
+                                   original_task=task_type, fallback_task=fallback_type,
+                                   error=f"{type(e).__name__}: {e}")
+                    try:
+                        fallback_tools = self._filter_tools_for_model(tools, fallback_config.get("model", ""))
+                        result = await self._route_with_retry(
+                            fallback_type, fallback_config, messages, temperature,
+                            fallback_config.get("max_tokens", 1000), stream,
+                            fallback_tools, tool_choice, timeout, user_openid, session_id,
+                        )
+                        return result
+                    except Exception as fb_err:
+                        logger.error("router.fallback_failed",
+                                     fallback_task=fallback_type,
+                                     error=f"{type(fb_err).__name__}: {fb_err}")
+
+            # 如果主提供商连续失败，尝试 Agnes 作为最终降级
+            if task_type not in ("chat_agnes",) and AGNES_API_KEY:
+                try:
+                    agnes_config = ROUTE_TABLE.get("chat_agnes")
+                    if agnes_config and self._agnes_client:
+                        logger.warning("router.agnes_fallback", original_task=task_type)
+                        agnes_tools = self._filter_tools_for_model(tools, agnes_config.get("model", ""))
+                        result = await self._route_with_retry(
+                            "chat_agnes", agnes_config, messages, temperature,
+                            agnes_config.get("max_tokens", 2000), stream,
+                            agnes_tools, tool_choice, timeout, user_openid, session_id,
+                        )
+                        return result
+                except Exception as agnes_err:
+                    logger.error("router.agnes_fallback_failed", error=str(agnes_err))
             raise
+
+    @staticmethod
+    def _classify_error(exc: Exception) -> str:
+        """将异常分类为可重试/不可重试错误类型。"""
+        exc_name = type(exc).__name__.lower()
+        exc_msg = str(exc).lower()
+        if isinstance(exc, asyncio.TimeoutError) or 'timeout' in exc_name or 'timeout' in exc_msg:
+            return 'timeout'
+        if 'rate' in exc_msg or '429' in exc_msg or 'rate_limit' in exc_name:
+            return 'rate_limit'
+        if 'connection' in exc_name or 'connection' in exc_msg or 'connect' in exc_msg:
+            return 'connection_error'
+        return 'unknown'
+
+    async def _route_with_retry(self, task_type: str, config: dict,
+                                 messages: list[dict], temperature: float,
+                                 max_tokens: int, stream: bool,
+                                 tools: list[dict] | None, tool_choice: str | None,
+                                 timeout: int, user_openid: str, session_id: str) -> str | object:
+        model = config["model"]
+        last_error = None
+        provider = config.get("client", "mimo")
+
+        # 应用 Prompt Caching（仅 MiMo 支持 cache_control 字段；
+        # 自定义 OpenAI 兼容端点收到该字段可能直接 400，导致静默降级）
+        if provider == "mimo":
+            messages = apply_cache_control(messages)
+
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                async with self._credential_lock:
+                    client = self._client
+                    if provider == "agnes" and self._agnes_client:
+                        client = self._agnes_client
+                    elif provider not in ("mimo", "agnes"):
+                        custom = getattr(self, "_custom_clients", {}).get(provider)
+                        if custom is None:
+                            raise RuntimeError(f"自定义 provider {provider} 未注册或缺少 API Key")
+                        client = custom
+                if not client:
+                    raise RuntimeError("MiMo client not initialized, check MIMO_API_KEY")
+
+                kwargs = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": stream,
+                }
+                if tools:
+                    kwargs["tools"] = tools
+                    kwargs["tool_choice"] = tool_choice or "auto"
+
+                # 支持 thinking 参数（Agnes Thinking 模式）
+                thinking_config = config.get("thinking")
+                if thinking_config:
+                    if provider == "agnes":
+                        kwargs["extra_body"] = {
+                            "chat_template_kwargs": {
+                                "enable_thinking": True
+                            }
+                        }
+                    # 对于 MiMo API（如果支持），添加类似参数
+                    # kwargs["extra_body"] = {"thinking": thinking_config}
+
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(**kwargs),
+                    timeout=timeout,
+                )
+
+                if stream:
+                    return response
+
+                self._track_cache(response)
+                await self._record_usage(task_type, model, response, user_openid, session_id)
+                self._check_cache_health()
+
+                # 报告凭证成功
+                await self._credential_pool.report_success(provider)
+
+                if tools and response.choices[0].message.tool_calls:
+                    _reasoning_content_var.set(getattr(response.choices[0].message, "reasoning_content", None) or "")
+                    return response
+
+                content = response.choices[0].message.content or ""
+                rc = getattr(response.choices[0].message, "reasoning_content", None) or ""
+                _reasoning_content_var.set(rc)
+                if not content:
+                    if rc:
+                        content = rc
+                return content
+
+            except Exception as e:
+                last_error = e
+                # 使用 ErrorClassifier 进行结构化错误分类
+                classified = self._error_classifier.classify(e)
+
+                # 报告凭证错误
+                await self._credential_pool.report_error(provider, classified)
+
+                # 根据恢复策略执行不同操作
+                if classified.action == RecoveryAction.ROTATE_CREDENTIAL:
+                    # 尝试轮换凭证
+                    new_cred = await self._credential_pool.get_credential(provider)
+                    # 获取当前使用的 API key
+                    async with self._credential_lock:
+                        current_key = ""
+                        if provider == "mimo" and self._client:
+                            current_key = self._client.api_key or ""
+                        elif provider == "agnes" and self._agnes_client:
+                            current_key = self._agnes_client.api_key or ""
+                        if new_cred and new_cred.api_key != current_key:
+                            logger.info("router.credential_rotated",
+                                        provider=provider,
+                                        key_suffix=new_cred.api_key[-6:])
+                            # 更新客户端使用新凭证
+                            new_client = AsyncOpenAI(
+                                api_key=new_cred.api_key,
+                                base_url=new_cred.base_url or (MIMO_BASE_URL if provider == "mimo" else AGNES_BASE_URL),
+                            )
+                            if provider == "mimo":
+                                self._client = new_client
+                            else:
+                                self._agnes_client = new_client
+
+                if classified.action == RecoveryAction.ABORT:
+                    logger.error("router.call_aborted", task=task_type, model=model,
+                                 reason=classified.reason.value,
+                                 error=f"{type(e).__name__}: {e}")
+                    raise
+
+                if not classified.is_retryable:
+                    logger.error("router.call_failed", task=task_type, model=model,
+                                 attempt=attempt + 1, reason=classified.reason.value,
+                                 action=classified.action.value,
+                                 error=f"{type(e).__name__}: {e}")
+                    raise
+
+                if attempt < MAX_RETRIES:
+                    # 使用 ErrorClassifier 计算的退避时间
+                    backoff = classified.backoff_seconds if classified.backoff_seconds > 0 else 1 * (attempt + 1)
+                    logger.warning("router.retry", task=task_type, model=model,
+                                   attempt=attempt + 1, reason=classified.reason.value,
+                                   action=classified.action.value,
+                                   backoff=f"{backoff:.1f}s",
+                                   error=f"{type(e).__name__}: {e}")
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error("router.retry_exhausted", task=task_type, model=model,
+                                 attempts=MAX_RETRIES + 1, reason=classified.reason.value,
+                                 error=f"{type(e).__name__}: {e}")
+        raise last_error
 
     def _track_cache(self, response):
         try:
@@ -202,8 +423,8 @@ class ModelRouter:
             if usage and hasattr(usage, "prompt_cache_hit_tokens"):
                 self._cache_stats["hit_tokens"] += getattr(usage, "prompt_cache_hit_tokens", 0)
                 self._cache_stats["miss_tokens"] += getattr(usage, "prompt_cache_miss_tokens", 0)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"缓存统计追踪失败: {e}")
 
     def _check_cache_health(self):
         now = time.time()
@@ -230,7 +451,24 @@ class ModelRouter:
             "hit_ratio": round(hit / total_tokens, 3) if total_tokens > 0 else 0.0,
         }
 
+    def _filter_tools_for_model(self, tools: list[dict] | None, model: str) -> list[dict] | None:
+        """检查工具列表与目标模型的兼容性，记录不兼容的工具。
+
+        当前仅做可观测性日志，不实际移除工具。后续可根据模型能力表做过滤。
+        """
+        if not tools:
+            return tools
+
+        # agnes 系列模型可能不支持工具调用，记录警告
+        agnes_models = {AGENT_CONFIG.get("model") for AGENT_CONFIG in [ROUTE_TABLE.get("chat_agnes")] if AGENT_CONFIG}
+        if model in agnes_models:
+            tool_names = [t.get("function", {}).get("name", "?") for t in tools]
+            logger.warning("router.tools_may_not_be_supported",
+                           model=model, tool_count=len(tools), tools=tool_names)
+
+        return tools
+
     def pop_reasoning_content(self) -> str | None:
-        rc = self._last_reasoning_content
-        self._last_reasoning_content = None
-        return rc
+        rc = _reasoning_content_var.get("")
+        _reasoning_content_var.set("")
+        return rc if rc else None

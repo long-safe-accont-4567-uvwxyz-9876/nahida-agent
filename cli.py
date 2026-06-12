@@ -23,24 +23,43 @@ logger.add(
 from agent_core import AgentCore
 from model_router import ROUTE_TABLE, MODEL_PREFERENCES
 
+# ── readline 支持 ──────────────────────────────────────────
+try:
+    import readline
+    _HIST_FILE = os.path.expanduser("~/.ai-agent/cli_history")
+    _HIST_SIZE = 500
+    try:
+        readline.read_history_file(_HIST_FILE)
+    except FileNotFoundError:
+        pass
+    readline.set_history_length(_HIST_SIZE)
+    import atexit
+    atexit.register(lambda: readline.write_history_file(_HIST_FILE))
+except ImportError:
+    pass  # readline 不可用时静默降级
+
+
+# ── NO_COLOR 支持 ─────────────────────────────────────────
+_NO_COLOR = bool(os.environ.get("NO_COLOR", ""))
+
 
 class _C:
-    RST = "\033[0m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    ITALIC = "\033[3m"
-    GREEN = "\033[32m"
-    LGREEN = "\033[92m"
-    DGREEN = "\033[38;2;76;153;0m"
-    CYAN = "\033[36m"
-    YELLOW = "\033[33m"
-    LYELLOW = "\033[93m"
-    MAGENTA = "\033[35m"
-    LMAGENTA = "\033[95m"
-    BLUE = "\033[34m"
-    LBLUE = "\033[94m"
-    WHITE = "\033[97m"
-    LEAF = "\033[38;2;107;142;35m"
+    RST = "" if _NO_COLOR else "\033[0m"
+    BOLD = "" if _NO_COLOR else "\033[1m"
+    DIM = "" if _NO_COLOR else "\033[2m"
+    ITALIC = "" if _NO_COLOR else "\033[3m"
+    GREEN = "" if _NO_COLOR else "\033[32m"
+    LGREEN = "" if _NO_COLOR else "\033[92m"
+    DGREEN = "" if _NO_COLOR else "\033[38;2;76;153;0m"
+    CYAN = "" if _NO_COLOR else "\033[36m"
+    YELLOW = "" if _NO_COLOR else "\033[33m"
+    LYELLOW = "" if _NO_COLOR else "\033[93m"
+    MAGENTA = "" if _NO_COLOR else "\033[35m"
+    LMAGENTA = "" if _NO_COLOR else "\033[95m"
+    BLUE = "" if _NO_COLOR else "\033[34m"
+    LBLUE = "" if _NO_COLOR else "\033[94m"
+    WHITE = "" if _NO_COLOR else "\033[97m"
+    LEAF = "" if _NO_COLOR else "\033[38;2;107;142;35m"
 
 
 NAHIDA_GREETINGS = [
@@ -128,8 +147,12 @@ def _get_model_info() -> str:
     return f"{model_id}"
 
 
-def _typewriter(text: str, delay: float = 0.02):
-    if not sys.stdout.isatty():
+def _typewriter(text: str, delay: float | None = None):
+    if delay is None:
+        speed = os.environ.get("NAHIDA_TYPEWRITER_SPEED", "normal").lower()
+        speed_map = {"fast": 0.005, "normal": 0.02, "slow": 0.05, "off": 0}
+        delay = speed_map.get(speed, 0.02)
+    if not sys.stdout.isatty() or delay == 0:
         print(text)
         return
     for ch in text:
@@ -305,6 +328,12 @@ class CLIInterface:
             except Exception as e:
                 logger.error("cli.process_error", error=str(e))
                 print(f"\n  {_C.LYELLOW}纳西妲: 嗯……出了点小问题：{str(e)[:100]}{_C.RST}")
+
+        # 主循环退出时安全关闭
+        try:
+            self._loop.run_until_complete(self.bot.shutdown())
+        except Exception as e:
+            logger.warning("cli.shutdown_error", error=str(e))
 
         self._loop.close()
 

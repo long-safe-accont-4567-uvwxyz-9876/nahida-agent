@@ -191,20 +191,34 @@ class SmartErrorHandler:
         
         logger.info("error_handler.learned", pattern=pattern_key)
 
-    def should_delegate_to_specialist(self, error_ctx: ErrorContext) -> tuple[bool, str]:
-        """判断是否应该将任务委托给专业子代理"""
-        
-        # 代码相关的错误应该委托给代码修复专家
+    def should_delegate_to_specialist(self, error_ctx: ErrorContext | str = None,
+                                      context: dict | None = None) -> str | None:
+        """判断是否应该将任务委托给专业子代理，返回子代理名称或 None"""
+
+        # 兼容传入字符串的情况
+        if isinstance(error_ctx, str):
+            error_type = error_ctx
+        elif isinstance(error_ctx, ErrorContext):
+            error_type = error_ctx.error_type
+        else:
+            return None
+
+        # 代码相关的错误应该委托给银狼
         code_error_types = {"SyntaxError", "IndentationError", "TypeError", "AttributeError"}
-        if error_ctx.error_type in code_error_types:
-            return True, "code_repair"
-        
-        # 数据库错误可能需要数据库管理员
+        if error_type in code_error_types:
+            return "银狼"
+
+        # 数据/搜索相关错误委托给昔涟
         db_error_types = {"OperationalError", "IntegrityError", "DatabaseError"}
-        if error_ctx.error_type in db_error_types:
-            return True, "db_admin"
-        
-        return False, ""
+        if error_type in db_error_types:
+            return "昔涟"
+
+        # 研究分析相关错误委托给尼可
+        research_error_types = {"ValueError", "KeyError", "RuntimeError"}
+        if error_type in research_error_types:
+            return "尼可"
+
+        return None
 
     async def get_repair_suggestion_from_agent(self, agent_name: str, 
                                              error_ctx: ErrorContext) -> str | None:

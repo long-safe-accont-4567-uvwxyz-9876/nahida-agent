@@ -1,0 +1,313 @@
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount } from 'vue'
+import {
+  NButton, NSwitch, NInput, NSelect, NTabs, NTabPane, NTag,
+  NPopconfirm, NProgress, useMessage,
+} from 'naive-ui'
+import { get, post, put, del } from '../api'
+import { getWsClient } from '../api/ws'
+import { useUiStore } from '../stores/ui'
+
+const message = useMessage()
+const ui = useUiStore()
+const ws = getWsClient()
+
+// TTS
+const ttsText = ref('')
+const ttsVoice = ref('nahida')
+const ttsStyle = ref<string | null>(null)
+const voices = ref<Array<{ label: string; value: string }>>([])
+const styles = ref<Array<{ label: string; value: string }>>([])
+const ttsResult = ref('')
+const ttsLoading = ref(false)
+
+// 图/视频
+const imagePrompt = ref('')
+const videoPrompt = ref('')
+const submitting = ref('')
+const tasks = ref<any[]>([])
+
+// 画廊
+const galleryType = ref<'image' | 'video' | 'audio'>('image')
+const gallery = ref<any[]>([])
+
+onMounted(async () => {
+  try {
+    const v = await get('/media/tts/voices')
+    voices.value = v.voices.map((x: any) => ({ label: `${x.id}${x.description ? ' · ' + x.description.slice(0, 16) : ''}`, value: x.id }))
+    styles.value = v.styles.map((s: string) => ({ label: s, value: s }))
+    const cfg = await get('/media/tts/config')
+    ui.autoSpeak = cfg.auto_speak
+    ttsVoice.value = cfg.default_voice || 'nahida'
+  } catch { /* TTS 可能未配置 */ }
+  loadTasks()
+  loadGallery()
+  ws.on('media_task_update', onTaskUpdate)
+})
+
+onBeforeUnmount(() => ws.off('media_task_update', onTaskUpdate))
+
+function onTaskUpdate(e: any) {
+  const t = tasks.value.find(x => x.id === e.task_id)
+  if (t) {
+    t.status = e.status
+    t.progress = e.progress
+    if (e.result_url) t.result_path = e.result_url
+    if (e.error) t.error = e.error
+  } else {
+    loadTasks()
+  }
+  if (e.status === 'done') {
+    message.success('生成完成 ✓')
+    loadGallery()
+  }
+  if (e.status === 'failed' && e.error) message.error(`任务失败：${e.error}`)
+}
+
+async function synthesize() {
+  if (!ttsText.value.trim()) return
+  ttsLoading.value = true
+  try {
+    const r = await post('/media/tts', {
+      text: ttsText.value, voice: ttsVoice.value, style: ttsStyle.value || '',
+    })
+    ttsResult.value = r.audio_url
+    if (r.cached) message.info('缓存命中，秒回 ⚡')
+    loadGallery()
+  } catch (e: any) {
+    message.error(e.message)
+  } finally {
+    ttsLoading.value = false
+  }
+}
+
+async function setAutoSpeak(v: boolean) {
+  try {
+    await ui.setAutoSpeak(v)
+    message.success(`自动朗读已${v ? '开启' : '关闭'} ✓`)
+  } catch (e: any) { message.error(e.message) }
+}
+
+async function setDefaultVoice(v: string) {
+  ttsVoice.value = v
+  try {
+    await put('/media/tts/config', { default_voice: v })
+  } catch { /* */ }
+}
+
+async function submitTask(kind: 'image' | 'video') {
+  const prompt = kind === 'image' ? imagePrompt.value : videoPrompt.value
+  if (!prompt.trim()) return
+  submitting.value = kind
+  try {
+    await post(`/media/${kind}`, { prompt })
+    message.success('任务已入队（进度实时推送）')
+    loadTasks()
+  } catch (e: any) {
+    message.error(e.message)
+  } finally {
+    submitting.value = ''
+  }
+}
+
+async function loadTasks() {
+  try { tasks.value = await get<any[]>('/media/tasks?limit=20') } catch { /* */ }
+}
+
+async function cancelTask(id: string) {
+  try {
+    await del(`/media/tasks/${id}`)
+    message.success('已取消')
+    loadTasks()
+  } catch (e: any) { message.error(e.message) }
+}
+
+async function loadGallery() {
+  try {
+    gallery.value = await get<any[]>(`/media/gallery?type=${galleryType.value}&limit=48`)
+  } catch (e: any) { message.error(e.message) }
+}
+
+async function removeMedia(name: string) {
+  try {
+    await del(`/media/gallery/${galleryType.value}/${name}`, true)
+    gallery.value = gallery.value.filter(g => g.name !== name)
+    message.success('已删除')
+  } catch (e: any) { message.error(e.message) }
+}
+
+function openUrl(url: string) {
+  window.open(url, '_blank')
+}
+
+const statusType: Record<string, any> = {
+  queued: 'default', running: 'info', done: 'success', failed: 'error',
+}
+</script>
+
+<template>
+  <div class="media-view">
+    <h2 class="view-title">🎙 媒体工坊</h2>
+
+    <n-tabs type="line" animated>
+      <n-tab-pane name="tts" tab="语音合成">
+        <div class="panel-row">
+          <div class="glass-panel panel main">
+            <n-input v-model:value="ttsText" type="textarea" :rows="4"
+                     placeholder="输入要合成的文本（≤500 字）…" maxlength="500" show-count />
+            <div class="tts-controls">
+              <n-select v-model:value="ttsVoice" :options="voices" placeholder="音色"
+                        style="max-width: 220px" @update:value="setDefaultVoice" />
+              <n-select v-model:value="ttsStyle" :options="styles" placeholder="情绪风格（自动）"
+                        clearable style="max-width: 180px" />
+              <n-button type="primary" :loading="ttsLoading" @click="synthesize">🎵 合成</n-button>
+            </div>
+            <audio v-if="ttsResult" :src="ttsResult" controls autoplay class="tts-player"></audio>
+          </div>
+          <div class="glass-panel panel side">
+            <h4>朗读设置</h4>
+            <label class="cfg">
+              自动朗读回复
+              <n-switch :value="ui.autoSpeak" @update:value="setAutoSpeak" />
+            </label>
+            <p class="cfg-hint">开启后，聊天页收到回复会自动合成并播放（音色跟随当前 Agent 的 voice_ref）。</p>
+          </div>
+        </div>
+      </n-tab-pane>
+
+      <n-tab-pane name="image" tab="图片生成">
+        <div class="glass-panel panel">
+          <n-input v-model:value="imagePrompt" type="textarea" :rows="3"
+                   placeholder="描述想生成的画面…" />
+          <n-button type="primary" style="margin-top: 10px"
+                    :loading="submitting === 'image'" @click="submitTask('image')">
+            🎨 提交生成任务
+          </n-button>
+        </div>
+      </n-tab-pane>
+
+      <n-tab-pane name="video" tab="视频生成">
+        <div class="glass-panel panel">
+          <p class="queue-hint">⏳ 视频生成耗时较长（数分钟），队列串行执行，进度实时推送。
+            当前队列 {{ tasks.filter(t => t.status === 'queued' || t.status === 'running').length }} 个任务。</p>
+          <n-input v-model:value="videoPrompt" type="textarea" :rows="3"
+                   placeholder="描述想生成的视频…" />
+          <n-button type="primary" style="margin-top: 10px"
+                    :loading="submitting === 'video'" @click="submitTask('video')">
+            🎬 提交生成任务
+          </n-button>
+        </div>
+      </n-tab-pane>
+    </n-tabs>
+
+    <section class="glass-panel section">
+      <h3>任务队列</h3>
+      <div class="task-list">
+        <div v-for="t in tasks" :key="t.id" class="task-row">
+          <n-tag size="small" :type="statusType[t.status]" :bordered="false">{{ t.status }}</n-tag>
+          <span class="task-kind">{{ t.kind }}</span>
+          <span class="task-prompt">{{ t.prompt }}</span>
+          <n-progress v-if="t.status === 'running'" type="line" :percentage="Math.round((t.progress || 0) * 100)"
+                      style="max-width: 140px" :height="6" />
+          <span v-if="t.error" class="task-error">{{ t.error }}</span>
+          <a v-if="t.result_path && t.status === 'done'" :href="t.result_path" target="_blank" class="task-link">查看</a>
+          <n-button v-if="t.status === 'queued'" size="tiny" quaternary @click="cancelTask(t.id)">取消</n-button>
+        </div>
+        <div v-if="!tasks.length" class="empty-hint">（暂无任务）</div>
+      </div>
+    </section>
+
+    <section class="glass-panel section">
+      <div class="gallery-head">
+        <h3>画廊</h3>
+        <n-tabs type="segment" size="small" v-model:value="galleryType"
+                @update:value="loadGallery" style="max-width: 280px">
+          <n-tab-pane name="image" tab="图片" />
+          <n-tab-pane name="video" tab="视频" />
+          <n-tab-pane name="audio" tab="音频" />
+        </n-tabs>
+      </div>
+      <div class="gallery-grid">
+        <div v-for="g in gallery" :key="g.name" class="gallery-card">
+          <img v-if="galleryType === 'image'" :src="g.url" loading="lazy" @click="openUrl(g.url)" />
+          <video v-else-if="galleryType === 'video'" :src="g.url" controls preload="metadata"></video>
+          <audio v-else :src="g.url" controls></audio>
+          <div class="gallery-meta">
+            <span class="g-name">{{ g.name }}</span>
+            <n-popconfirm @positive-click="removeMedia(g.name)">
+              <template #trigger><button class="g-del">🗑</button></template>
+              确认删除该文件？
+            </n-popconfirm>
+          </div>
+        </div>
+        <div v-if="!gallery.length" class="empty-hint">这里还没有长出叶子哦～生成点什么吧</div>
+      </div>
+    </section>
+  </div>
+</template>
+
+<style scoped>
+.view-title { font-family: 'Noto Serif SC', serif; margin-bottom: 14px; }
+
+.panel-row { display: flex; gap: 14px; flex-wrap: wrap; }
+.panel { padding: 16px 18px; }
+.panel.main { flex: 2; min-width: 300px; }
+.panel.side { flex: 1; min-width: 220px; }
+.panel h4 { font-size: 13px; color: var(--dendro); margin-bottom: 10px; }
+
+.tts-controls { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.tts-player { width: 100%; margin-top: 12px; }
+
+.cfg { display: flex; align-items: center; justify-content: space-between; font-size: 13.5px; }
+.cfg-hint { font-size: 12px; color: var(--moon-dim); margin-top: 10px; line-height: 1.6; }
+
+.queue-hint { font-size: 12.5px; color: var(--wisdom); margin-bottom: 10px; }
+
+.section { padding: 16px 18px; margin-top: 14px; }
+.section h3 { font-size: 14px; color: var(--dendro); margin-bottom: 10px; }
+
+.task-list { display: flex; flex-direction: column; gap: 6px; }
+.task-row {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 13px; padding: 6px 4px;
+  border-bottom: 1px solid rgba(127, 214, 80, 0.06);
+  flex-wrap: wrap;
+}
+.task-kind { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--wisdom); }
+.task-prompt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 120px; }
+.task-error { color: var(--alert); font-size: 12px; }
+.task-link { color: var(--dendro); font-size: 12px; }
+
+.gallery-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 12px; }
+.gallery-head h3 { margin: 0; }
+
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.gallery-card {
+  border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--glass-border);
+  background: rgba(15, 31, 23, 0.4);
+  transition: transform 0.2s var(--ease-out), border-color 0.2s;
+}
+.gallery-card:hover {
+  transform: perspective(600px) translateZ(8px);
+  border-color: rgba(127, 214, 80, 0.4);
+}
+.gallery-card img { width: 100%; height: 140px; object-fit: cover; cursor: zoom-in; display: block; }
+.gallery-card video { width: 100%; display: block; }
+.gallery-card audio { width: 100%; padding: 8px; }
+
+.gallery-meta {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 10px; font-size: 11px; color: var(--moon-dim);
+}
+.g-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: 'JetBrains Mono', monospace; }
+.g-del { background: none; border: none; cursor: pointer; opacity: 0.6; }
+.g-del:hover { opacity: 1; }
+
+.empty-hint { color: var(--moon-dim); font-size: 13px; padding: 16px 0; text-align: center; grid-column: 1 / -1; }
+</style>

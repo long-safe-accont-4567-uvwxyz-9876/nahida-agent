@@ -1,0 +1,187 @@
+"""后台任务管理器 — 从 agent_core.py 提取的 fire-and-forget 后台协程。
+
+职责：
+- 对话日志写入
+- 会话更新
+- 记忆编码
+- 笔记自动提取
+- 画像冷启动
+- 学习评估
+- 本能提取 + curator
+- 会话自动归档
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+
+from loguru import logger
+
+if TYPE_CHECKING:
+    from database import DatabaseManager
+    from memory_manager import MemoryManager
+    from notebook_manager import NotebookManager
+    from portrait_manager import PortraitManager
+    from learning_manager import LearningManager
+    from instinct_manager import InstinctManager
+    from agent_context import AgentContext
+
+# 全局后台任务集合，用于跟踪和清理
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro):
+    """创建 fire-and-forget 后台任务，自动从 _bg_tasks 中移除已完成的任务。"""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+class BackgroundTaskManager:
+    """管理 AgentCore 的所有后台异步任务。
+
+    接收对子系统的引用，避免 AgentCore 直接持有后台任务逻辑。
+    """
+
+    def __init__(
+        self,
+        db: DatabaseManager,
+        context: AgentContext,
+        memory: MemoryManager | None = None,
+        notebook_manager: NotebookManager | None = None,
+        portrait_manager: PortraitManager | None = None,
+        learning_manager: LearningManager | None = None,
+        instinct_manager: InstinctManager | None = None,
+    ):
+        self.db = db
+        self.context = context
+        self.memory = memory
+        self.notebook_manager = notebook_manager
+        self.portrait_manager = portrait_manager
+        self.learning_manager = learning_manager
+        self.instinct_manager = instinct_manager
+        self._conversation_count = 0
+        self._conv_count_lock = asyncio.Lock()
+
+    def start_background_task(self, coro):
+        """启动一个 fire-and-forget 后台任务。"""
+        _spawn(coro)
+
+    def run_background_tasks(
+        self,
+        user_input: str,
+        reply: str,
+        user_id: str,
+        source: str,
+        emotion: dict,
+        tool_results: list,
+        session_id: str = "",
+    ) -> None:
+        """启动所有后台任务（fire-and-forget）。"""
+        _spawn(
+            self._background_tasks(
+                user_input, reply, user_id, source, emotion, tool_results,
+                session_id=session_id,
+            )
+        )
+
+    async def _background_tasks(
+        self,
+        user_input: str,
+        reply: str,
+        user_id: str,
+        source: str,
+        emotion: dict,
+        tool_results: list,
+        session_id: str = "",
+    ) -> None:
+        # 1. 对话日志
+        try:
+            await self.db.insert_conversation_log(
+                user_id=user_id,
+                source=source,
+                user_message=user_input,
+                assistant_reply=reply,
+                emotion_label=emotion.get("primary", ""),
+                session_id=session_id,
+            )
+        except Exception as e:
+            logger.warning("bg.conversation_log_failed", error=str(e))
+
+        # 2. 会话更新
+        if session_id:
+            try:
+                await self.db.update_session(session_id)
+            except Exception as e:
+                logger.warning("bg.session_update_failed", error=str(e))
+
+        # 3. 记忆编码
+        if self.memory and len(self.context.history) >= 4:
+            try:
+                ctx = {
+                    "exchanges": self.context.get_last_n(6),
+                    "emotion": emotion,
+                }
+                await self.memory.try_idle_encode(ctx, force=True)
+            except Exception as e:
+                logger.warning("bg.memory_encode_failed", error=str(e))
+
+        # 4. 笔记自动提取
+        if self.notebook_manager:
+            _spawn(self.notebook_manager.auto_note_after_message(user_input, reply))
+
+        # 5. 画像标记脏 + 冷启动
+        if self.portrait_manager:
+            self.portrait_manager.mark_dirty()
+
+        if self.portrait_manager and len(self.context.history) >= 4:
+            _spawn(self._portrait_cold_start())
+
+        # 6. 学习评估
+        if self.learning_manager:
+            _spawn(
+                self.learning_manager.evaluate_after_conversation(user_input, reply, tool_results)
+            )
+
+        # 7. 本能提取 + curator
+        if self.instinct_manager:
+            _spawn(
+                self.instinct_manager.extract_instincts(user_input, reply, session_id)
+            )
+            # 每 10 轮对话运行一次 curator（归档过期 + 合并重复）
+            async with self._conv_count_lock:
+                self._conversation_count += 1
+                should_curate = self._conversation_count % 10 == 0
+            if should_curate:
+                _spawn(self.instinct_manager.curator_run())
+
+        # 8. 会话自动归档
+        _spawn(self._auto_archive_sessions())
+
+    async def _auto_archive_sessions(self) -> None:
+        try:
+            archived = await self.db.auto_archive_stale_sessions(idle_seconds=3600)
+            if archived > 0:
+                logger.info("session.auto_archived", count=archived)
+        except Exception as e:
+            logger.warning("session.auto_archive_failed", error=str(e))
+
+    async def _portrait_cold_start(self) -> None:
+        try:
+            result = await self.portrait_manager.ensure_exists()
+            if result:
+                self.context.user_portrait = result
+                logger.info("portrait.cold_start_done", length=len(result))
+        except Exception as e:
+            logger.warning("portrait.cold_start_failed", error=str(e))
+
+    @staticmethod
+    def get_bg_tasks() -> set[asyncio.Task]:
+        """返回当前活跃的后台任务集合（供 shutdown 使用）。"""
+        return _bg_tasks
+
+    @staticmethod
+    def clear_bg_tasks() -> None:
+        """清空后台任务集合。"""
+        _bg_tasks.clear()

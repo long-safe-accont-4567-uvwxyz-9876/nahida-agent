@@ -9,11 +9,15 @@ class AnalyticsDB:
         self._conn = conn
         conn.row_factory = aiosqlite.Row
 
+    async def commit(self):
+        await self._conn.commit()
+
     async def insert_api_usage(self, user_openid: str = "", session_id: str = "",
                                 model: str = "", task_type: str = "",
                                 prompt_tokens: int = 0, completion_tokens: int = 0,
                                 cache_hit_tokens: int = 0, cache_miss_tokens: int = 0,
-                                cost_usd: float = 0.0) -> str:
+                                cost_usd: float = 0.0,
+                                auto_commit: bool = True) -> str:
         now = time.time()
         date_str = time.strftime("%Y%m%d", time.localtime(now))
         usage_id = f"API-{date_str}-{int(now % 100000):05d}"
@@ -28,12 +32,14 @@ class AnalyticsDB:
                  prompt_tokens, completion_tokens, cache_hit_tokens, cache_miss_tokens,
                  cost_usd, now),
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
             return usage_id
         except Exception:
             return ""
 
-    async def batch_insert_api_usage(self, records: list[dict]):
+    async def batch_insert_api_usage(self, records: list[dict],
+                                      auto_commit: bool = True):
         if not records:
             return
         now = time.time()
@@ -63,18 +69,21 @@ class AnalyticsDB:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
         except Exception as e:
             logger.warning("db.batch_api_usage_failed", error=str(e))
 
     async def insert_proactive_message(self, user_id: str, message_type: str,
-                                        content: str) -> int:
+                                        content: str,
+                                        auto_commit: bool = True) -> int:
         cursor = await self._conn.execute(
             """INSERT INTO proactive_messages (user_id, message_type, content, sent_at)
                VALUES (?, ?, ?, ?)""",
             (user_id, message_type, content, time.time()),
         )
-        await self._conn.commit()
+        if auto_commit:
+            await self._conn.commit()
         return cursor.lastrowid
 
     async def get_recent_proactive_messages(self, user_id: str,
@@ -147,7 +156,8 @@ class AnalyticsDB:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def batch_insert_events(self, events: list[dict]):
+    async def batch_insert_events(self, events: list[dict],
+                                   auto_commit: bool = True):
         if not events:
             return
         rows = []
@@ -165,7 +175,8 @@ class AnalyticsDB:
                    VALUES (?, ?, ?, ?, ?)""",
                 rows,
             )
-            await self._conn.commit()
+            if auto_commit:
+                await self._conn.commit()
         except Exception as e:
             logger.warning("db.batch_events_failed", error=str(e))
 

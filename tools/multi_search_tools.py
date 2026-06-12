@@ -14,7 +14,7 @@ def _deep_search(query: str, max_results: int = 10) -> tuple[list[dict], str]:
 
     if TAVILY_API_KEY:
         try:
-            results = _tavily_search_sync(query, max_results, search_depth="advanced")
+            results, _answer = _tavily_search_sync(query, max_results, search_depth="advanced")
             if results:
                 return results, "Tavily"
         except Exception:
@@ -23,22 +23,29 @@ def _deep_search(query: str, max_results: int = 10) -> tuple[list[dict], str]:
     return [], ""
 
 
-@register_tool(
-    name="multi_search",
-    description="[已禁用] 请使用 web_search 代替。",
-    schema={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "搜索关键词"},
-        },
-        "required": ["query"],
-    },
-    permission=ToolPermission.READ_ONLY,
-    category="search",
-    max_frequency=0,
-)
-def multi_search(query: str) -> ToolResult:
-    return ToolResult.fail("multi_search 已禁用，请使用 web_search")
+# multi_search 已禁用，不再注册到工具列表。
+# 如需重新启用，取消下方注释即可。
+
+# @register_tool(
+#     name="multi_search",
+#     description="多源搜索：先尝试 Bing，无结果时回退到 Tavily。",
+#     schema={
+#         "type": "object",
+#         "properties": {
+#             "query": {"type": "string", "description": "搜索关键词"},
+#         },
+#         "required": ["query"],
+#     },
+#     permission=ToolPermission.READ_ONLY,
+#     category="search",
+#     max_frequency=5,
+# )
+# def multi_search(query: str) -> ToolResult:
+#     results, source = _deep_search(query)
+#     if not results:
+#         return ToolResult.fail("搜索无结果，请尝试其他关键词")
+#     formatted = _format_results(results, source)
+#     return ToolResult.ok(formatted)
 
 
 @register_tool(
@@ -57,13 +64,10 @@ def multi_search(query: str) -> ToolResult:
 )
 def wolfram_query(query: str) -> ToolResult:
     try:
-        import urllib.request, urllib.parse, ssl, re
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+        import urllib.request, urllib.parse, re
         url = f"https://www.wolframalpha.com/input?i={urllib.parse.quote(query)}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=20) as resp:
             html = resp.read().decode('utf-8', errors='ignore')
             values = re.findall(r'"plaintext":"([^"]+)"', html)
             if values:

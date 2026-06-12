@@ -1,6 +1,7 @@
 import json
 import asyncio
 import hashlib
+import threading
 from collections import OrderedDict
 from pathlib import Path
 from loguru import logger
@@ -62,6 +63,8 @@ class VectorStore:
         self._embed_base_url = embed_base_url
         self._embed_model = embed_model
         self._initialized = False
+        self._closed = False
+        self._lock = threading.Lock()
         self._embed_client = None
         self._vec_conn = None
         self._cache = EmbedCache(max_size=128)
@@ -72,6 +75,14 @@ class VectorStore:
                 base_url=embed_base_url or "https://api.siliconflow.cn/v1",
             )
 
+    @property
+    def ready(self) -> bool:
+        return self._initialized and not self._closed
+
+    @property
+    def enabled(self) -> bool:
+        return self._initialized
+
     async def init(self):
         if not HAS_SQLITE_VEC:
             logger.warning("vector_store.sqlite_vec_missing")
@@ -79,29 +90,41 @@ class VectorStore:
 
         import sqlite3
 
-        self._vec_conn = sqlite3.connect(self._db_path)
-        self._vec_conn.enable_load_extension(True)
-        sqlite_vec.load(self._vec_conn)
-        self._vec_conn.enable_load_extension(False)
+        def _init_db():
+            with self._lock:
+                conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
 
-        self._vec_conn.execute("PRAGMA journal_mode=WAL")
-        self._vec_conn.execute("PRAGMA synchronous=NORMAL")
-        self._vec_conn.execute("PRAGMA cache_size=-20000")
-        self._vec_conn.execute("PRAGMA mmap_size=67108864")
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA cache_size=-20000")
+                conn.execute("PRAGMA mmap_size=67108864")
 
-        self._vec_conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec
-            USING vec0(embedding float[1024])
-        """)
-        self._vec_conn.commit()
+                conn.execute("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS memories_vec
+                    USING vec0(embedding float[1024])
+                """)
+                conn.commit()
+                return conn
+
+        self._vec_conn = await asyncio.to_thread(_init_db)
 
         self._initialized = True
         logger.info("vector_store.ready", pragmas="WAL+cache+mmap")
 
     async def close(self):
-        if self._vec_conn:
-            self._vec_conn.close()
-            self._vec_conn = None
+        def _do_close():
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                if self._vec_conn:
+                    self._vec_conn.close()
+                    self._vec_conn = None
+
+        await asyncio.to_thread(_do_close)
         if self._cache.stats["size"] > 0:
             logger.info("vector_store.cache_stats", **self._cache.stats)
 
@@ -140,47 +163,92 @@ class VectorStore:
 
         vec_json = json.dumps(vec)
 
+        def _do_upsert():
+            with self._lock:
+                if self._closed:
+                    return False
+                try:
+                    self._vec_conn.execute("BEGIN TRANSACTION")
+                    try:
+                        self._vec_conn.execute("DELETE FROM memories_vec WHERE rowid=?", [row_id])
+                    except Exception as e:
+                        logger.debug(f"vector_store upsert 删除旧记录失败(rowid={row_id}): {e}")
+                    self._vec_conn.execute(
+                        "INSERT INTO memories_vec(rowid, embedding) VALUES (?, vec_f32(?))",
+                        [row_id, vec_json],
+                    )
+                    self._vec_conn.commit()
+                    return True
+                except Exception as e:
+                    try:
+                        self._vec_conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    logger.warning("vector_store.upsert_failed", row_id=row_id, error=str(e))
+                    return False
+
+        return await asyncio.to_thread(_do_upsert)
+
+    async def delete(self, row_id: int) -> bool:
+        """删除指定 rowid 的向量记录"""
+        if not self._initialized or not self._vec_conn:
+            return False
+
+        def _do_delete():
+            with self._lock:
+                if self._closed:
+                    return False
+                try:
+                    self._vec_conn.execute("DELETE FROM memories_vec WHERE rowid=?", [row_id])
+                    self._vec_conn.commit()
+                    return True
+                except Exception as e:
+                    logger.warning("vector_store.delete_failed", row_id=row_id, error=str(e))
+                    return False
+
         try:
-            try:
-                self._vec_conn.execute("DELETE FROM memories_vec WHERE rowid=?", [row_id])
-            except Exception:
-                pass
-            self._vec_conn.execute(
-                "INSERT INTO memories_vec(rowid, embedding) VALUES (?, vec_f32(?))",
-                [row_id, vec_json],
-            )
-            self._vec_conn.commit()
-            return True
+            return await asyncio.to_thread(_do_delete)
         except Exception as e:
-            logger.warning("vector_store.upsert_failed", error=str(e))
+            logger.warning("vector_store.delete_failed", row_id=row_id, error=str(e))
             return False
 
     async def batch_upsert(self, items: list[tuple[int, str]]) -> int:
         if not self._initialized or not self._vec_conn:
             return 0
 
-        success = 0
+        # Embed all items first (these are already async)
+        embed_results = []
         for row_id, text in items:
             vec = await self.embed(text)
-            if not vec:
-                continue
-            vec_json = json.dumps(vec)
-            try:
-                try:
-                    self._vec_conn.execute("DELETE FROM memories_vec WHERE rowid=?", [row_id])
-                except Exception:
-                    pass
-                self._vec_conn.execute(
-                    "INSERT INTO memories_vec(rowid, embedding) VALUES (?, vec_f32(?))",
-                    [row_id, vec_json],
-                )
-                success += 1
-            except Exception as e:
-                logger.warning("vector_store.batch_upsert_item_failed", row_id=row_id, error=str(e))
+            embed_results.append((row_id, vec))
 
-        if success > 0:
-            self._vec_conn.commit()
-        return success
+        def _do_batch():
+            with self._lock:
+                if self._closed:
+                    return 0
+                success = 0
+                for row_id, vec in embed_results:
+                    if not vec:
+                        continue
+                    vec_json = json.dumps(vec)
+                    try:
+                        try:
+                            self._vec_conn.execute("DELETE FROM memories_vec WHERE rowid=?", [row_id])
+                        except Exception as e:
+                            logger.debug(f"vector_store batch_upsert 删除旧记录失败(rowid={row_id}): {e}")
+                        self._vec_conn.execute(
+                            "INSERT INTO memories_vec(rowid, embedding) VALUES (?, vec_f32(?))",
+                            [row_id, vec_json],
+                        )
+                        success += 1
+                    except Exception as e:
+                        logger.warning("vector_store.batch_upsert_item_failed", row_id=row_id, error=str(e))
+
+                if success > 0:
+                    self._vec_conn.commit()
+                return success
+
+        return await asyncio.to_thread(_do_batch)
 
     async def search(self, query_text: str, top_k: int = 5) -> list[tuple[int, float]]:
         if not self._initialized or not self._vec_conn:
@@ -192,13 +260,19 @@ class VectorStore:
 
         vec_json = json.dumps(vec)
 
+        def _do_search():
+            with self._lock:
+                if self._closed:
+                    return []
+                rows = self._vec_conn.execute(
+                    "SELECT rowid, distance FROM memories_vec "
+                    "WHERE embedding MATCH vec_f32(?) AND k=? ORDER BY distance",
+                    [vec_json, top_k],
+                ).fetchall()
+                return [(row[0], row[1]) for row in rows]
+
         try:
-            rows = self._vec_conn.execute(
-                "SELECT rowid, distance FROM memories_vec "
-                "WHERE embedding MATCH vec_f32(?) AND k=? ORDER BY distance",
-                [vec_json, top_k],
-            ).fetchall()
-            return [(row[0], row[1]) for row in rows]
+            return await asyncio.to_thread(_do_search)
         except Exception as e:
             logger.warning("vector_store.search_failed", error=str(e))
             return []
