@@ -7,6 +7,7 @@ and registers them into the existing tool_registry.
 import asyncio
 import json
 import os
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
@@ -15,16 +16,47 @@ import tool_registry
 from tool_registry import ToolPermission, ToolResult
 
 
-class MCPClient:
-    """MCP Client that connects to an MCP server via stdio."""
+@dataclass
+class MCPTransportConfig:
+    """MCP 服务器传输配置"""
+    transport: str = "stdio"  # "stdio" | "sse" | "streamable-http"
+    command: str = ""
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    url: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    namespace: str = ""
+    enabled: bool = True
+    reconnect_attempts: int = 3
+    reconnect_delay_seconds: float = 5.0
+    tool_timeout_seconds: float = 60.0
 
-    def __init__(self, server_name: str, command: str, args: list[str], env: dict | None = None):
+
+class MCPClient:
+    """MCP Client that connects to an MCP server via stdio, SSE, or HTTP."""
+
+    def __init__(self, server_name: str, command: str | MCPTransportConfig = "",
+                 args: list[str] | None = None, env: dict | None = None):
+        # Backward compatibility: if command is a string, wrap in MCPTransportConfig
+        if isinstance(command, MCPTransportConfig):
+            self._config = command
+        else:
+            self._config = MCPTransportConfig(
+                transport="stdio",
+                command=command,
+                args=args or [],
+                env=env or {},
+            )
+
         self.server_name = server_name
-        self.command = command
-        self.args = args
-        self.env = env
+        # Keep legacy attributes for backward compatibility
+        self.command = self._config.command
+        self.args = self._config.args
+        self.env = self._config.env or None
 
         self._process: asyncio.subprocess.Process | None = None
+        self._http_client: Any = None  # httpx.AsyncClient for SSE/HTTP
+        self._connected: bool = False
         self._next_id: int = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._read_task: asyncio.Task | None = None
@@ -44,16 +76,28 @@ class MCPClient:
 
     # ── lifecycle ───────────────────────────────────────────────
 
-    async def start(self) -> None:
-        """Start the MCP server subprocess and perform initialization handshake."""
+    async def connect(self) -> bool:
+        """根据传输类型连接 MCP 服务器"""
+        if self._config.transport == "stdio":
+            return await self._connect_stdio()
+        elif self._config.transport == "sse":
+            return await self._connect_sse()
+        elif self._config.transport == "streamable-http":
+            return await self._connect_http()
+        else:
+            logger.warning("mcp.unknown_transport", transport=self._config.transport)
+            return False
+
+    async def _connect_stdio(self) -> bool:
+        """通过 stdio 传输连接 MCP 服务器（子进程方式）"""
         try:
             proc_env = dict(os.environ)
-            if self.env:
-                proc_env.update(self.env)
+            if self._config.env:
+                proc_env.update(self._config.env)
 
             self._process = await asyncio.create_subprocess_exec(
-                self.command,
-                *self.args,
+                self._config.command,
+                *self._config.args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -99,18 +143,64 @@ class MCPClient:
             for tool_info in tools:
                 self._register_mcp_tool(tool_info)
 
+            self._connected = True
             self._available = True
             logger.info("mcp_client.started", server=self.server_name,
                         tools=list(self._tool_names))
+            return True
 
         except Exception as e:
             logger.error("mcp_client.start_failed", server=self.server_name, error=str(e))
             await self.stop()
-            raise
+            return False
+
+    async def _connect_sse(self) -> bool:
+        """通过 SSE 传输连接 MCP 服务器"""
+        try:
+            import httpx
+            self._http_client = httpx.AsyncClient(
+                base_url=self._config.url,
+                headers=self._config.headers or {},
+                timeout=30.0,
+            )
+            # Test connection with a simple request
+            resp = await self._http_client.get("/health")
+            if resp.status_code in (200, 404):  # 404 is OK, server might not have /health
+                self._connected = True
+                self._available = True
+                logger.info("mcp.sse_connected", url=self._config.url)
+                return True
+        except Exception as e:
+            logger.warning("mcp.sse_connect_failed", url=self._config.url, error=str(e))
+        return False
+
+    async def _connect_http(self) -> bool:
+        """通过 Streamable HTTP 传输连接 MCP 服务器"""
+        try:
+            import httpx
+            self._http_client = httpx.AsyncClient(
+                base_url=self._config.url,
+                headers=self._config.headers or {},
+                timeout=30.0,
+            )
+            self._connected = True
+            self._available = True
+            logger.info("mcp.http_connected", url=self._config.url)
+            return True
+        except Exception as e:
+            logger.warning("mcp.http_connect_failed", url=self._config.url, error=str(e))
+        return False
+
+    async def start(self) -> None:
+        """Start the MCP server (backward compatible wrapper for connect)."""
+        result = await self.connect()
+        if not result:
+            raise RuntimeError(f"MCP server '{self.server_name}' failed to start")
 
     async def stop(self) -> None:
-        """Stop the MCP server subprocess gracefully."""
+        """Stop the MCP server gracefully."""
         self._available = False
+        self._connected = False
 
         # Cancel pending futures
         for fut in self._pending.values():
@@ -140,6 +230,14 @@ class MCPClient:
 
         self._process = None
 
+        # Close HTTP client for SSE/HTTP transports
+        if self._http_client:
+            try:
+                await self._http_client.aclose()
+            except Exception:
+                pass
+            self._http_client = None
+
         # Unregister tools from tool_registry (使用公共 API)
         for name in self._registered_names:
             tool_registry.unregister_tool(name)
@@ -147,6 +245,10 @@ class MCPClient:
         self._tool_names.clear()
 
         logger.info("mcp_client.stopped", server=self.server_name)
+
+    async def disconnect(self) -> None:
+        """Disconnect from the MCP server (alias for stop)."""
+        await self.stop()
 
     # ── tool call ───────────────────────────────────────────────
 
@@ -344,30 +446,67 @@ class MCPManager:
     def __init__(self):
         self._clients: dict[str, MCPClient] = {}
         self._sdk_servers: dict[str, SdkMcpServer] = {}
+        self._health_task: asyncio.Task | None = None
+        self._tool_enabled_map: dict[str, dict[str, bool]] = {}  # {server_name: {tool_name: enabled}}
+        self._allowed_stdio_commands: list[str] = []
+        self._allowed_url_prefixes: list[str] = []
 
     async def start_all(self, configs: dict[str, dict]) -> None:
         """Start all configured MCP servers.
 
-        configs format:
+        configs format (backward compatible):
         {
             "git": {
                 "command": "/path/to/uvx",
                 "args": ["mcp-server-git", "--repository", "/path"],
                 "env": {"UV_INDEX_URL": "..."}
             },
+            "remote": {
+                "transport": "sse",
+                "url": "http://localhost:8080/sse",
+                "headers": {"Authorization": "Bearer xxx"}
+            },
             ...
         }
         """
         for server_name, cfg in configs.items():
-            command = cfg.get("command", "")
-            args = cfg.get("args", [])
-            env = cfg.get("env")
+            transport = cfg.get("transport", "stdio")
 
-            if not command:
-                logger.warning("mcp_manager.skip_no_command", server=server_name)
+            if transport == "stdio":
+                command = cfg.get("command", "")
+                if not command:
+                    logger.warning("mcp_manager.skip_no_command", server=server_name)
+                    continue
+                config = MCPTransportConfig(
+                    transport="stdio",
+                    command=command,
+                    args=cfg.get("args", []),
+                    env=cfg.get("env", {}),
+                )
+            elif transport in ("sse", "streamable-http"):
+                url = cfg.get("url", "")
+                if not url:
+                    logger.warning("mcp_manager.skip_no_url", server=server_name)
+                    continue
+                config = MCPTransportConfig(
+                    transport=transport,
+                    url=url,
+                    headers=cfg.get("headers", {}),
+                    namespace=cfg.get("namespace", ""),
+                    reconnect_attempts=cfg.get("reconnect_attempts", 3),
+                    reconnect_delay_seconds=cfg.get("reconnect_delay_seconds", 5.0),
+                    tool_timeout_seconds=cfg.get("tool_timeout_seconds", 60.0),
+                )
+            else:
+                logger.warning("mcp_manager.skip_unknown_transport",
+                               server=server_name, transport=transport)
                 continue
 
-            client = MCPClient(server_name, command, args, env)
+            if not cfg.get("enabled", True):
+                logger.info("mcp_manager.skip_disabled", server=server_name)
+                continue
+
+            client = MCPClient(server_name, config)
             self._clients[server_name] = client
 
             try:
@@ -379,6 +518,15 @@ class MCPManager:
 
     async def stop_all(self) -> None:
         """Stop all MCP servers."""
+        # Stop health monitor
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+            self._health_task = None
+
         for server_name, client in self._clients.items():
             try:
                 await client.stop()
@@ -396,8 +544,113 @@ class MCPManager:
                 from tool_registry import unregister_tool
                 unregister_tool(full_name)
 
+    # ── health monitoring ────────────────────────────────────────
+
+    async def start_health_monitor(self, interval_seconds: int = 60):
+        """启动健康监控"""
+        self._health_task = asyncio.create_task(self._health_loop(interval_seconds))
+
+    async def _health_loop(self, interval: int):
+        while True:
+            await asyncio.sleep(interval)
+            for name, client in list(self._clients.items()):
+                try:
+                    if client._http_client:
+                        resp = await client._http_client.get("/health", timeout=5.0)
+                        healthy = resp.status_code < 500
+                    elif client._process:
+                        healthy = client._process.returncode is None
+                    else:
+                        healthy = client._connected
+
+                    if not healthy:
+                        logger.warning("mcp.health_check_failed", server=name)
+                        await self._reconnect_server(name)
+                except Exception as e:
+                    logger.warning("mcp.health_check_error", server=name, error=str(e))
+                    await self._reconnect_server(name)
+
+    async def _reconnect_server(self, name: str):
+        """指数退避重连"""
+        client = self._clients.get(name)
+        if not client:
+            return
+        config = client._config
+        for attempt in range(config.reconnect_attempts):
+            delay = config.reconnect_delay_seconds * (2 ** attempt)
+            logger.info("mcp.reconnect_attempt", server=name, attempt=attempt + 1, delay=delay)
+            await asyncio.sleep(delay)
+            try:
+                await client.disconnect()
+                if await client.connect():
+                    logger.info("mcp.reconnected", server=name)
+                    return
+            except Exception as e:
+                logger.warning("mcp.reconnect_failed", server=name, attempt=attempt + 1, error=str(e))
+        logger.error("mcp.reconnect_exhausted", server=name)
+
+    # ── tool-level permissions ───────────────────────────────────
+
+    def set_tool_enabled(self, server_name: str, tool_name: str, enabled: bool):
+        """设置单个工具的启用/禁用状态"""
+        if server_name not in self._tool_enabled_map:
+            self._tool_enabled_map[server_name] = {}
+        self._tool_enabled_map[server_name][tool_name] = enabled
+
+    def is_tool_enabled(self, server_name: str, tool_name: str) -> bool:
+        """检查工具是否启用（默认启用）"""
+        server_map = self._tool_enabled_map.get(server_name, {})
+        return server_map.get(tool_name, True)
+
+    # ── dynamic server security ──────────────────────────────────
+
+    def set_security_policy(self, allowed_stdio_commands: list[str] | None = None,
+                           allowed_url_prefixes: list[str] | None = None):
+        """设置动态服务器的安全策略"""
+        self._allowed_stdio_commands = allowed_stdio_commands or []
+        self._allowed_url_prefixes = allowed_url_prefixes or []
+
+    def validate_dynamic_server(self, config: MCPTransportConfig) -> str | None:
+        """验证动态添加的服务器配置，返回错误原因或 None"""
+        if config.transport == "stdio":
+            if self._allowed_stdio_commands and config.command not in self._allowed_stdio_commands:
+                return f"Command '{config.command}' not in allowed list"
+        elif config.transport in ("sse", "streamable-http"):
+            if self._allowed_url_prefixes and not any(
+                config.url.startswith(prefix) for prefix in self._allowed_url_prefixes
+            ):
+                return f"URL '{config.url}' does not match any allowed prefix"
+        return None
+
+    async def add_server(self, server_name: str, config: MCPTransportConfig) -> bool:
+        """动态添加 MCP 服务器"""
+        # Security check
+        error = self.validate_dynamic_server(config)
+        if error:
+            logger.warning("mcp.add_server_rejected", server=server_name, reason=error)
+            return False
+
+        if not config.enabled:
+            logger.info("mcp.add_server_disabled", server=server_name)
+            return False
+
+        client = MCPClient(server_name, config)
+        self._clients[server_name] = client
+
+        try:
+            if await client.connect():
+                logger.info("mcp_manager.server_added", server=server_name)
+                return True
+            else:
+                logger.error("mcp_manager.server_add_failed", server=server_name)
+                return False
+        except Exception as e:
+            logger.error("mcp_manager.server_add_failed",
+                         server=server_name, error=str(e))
+            return False
+
     def get_tools_for_agent(self, mcp_servers: list[str]) -> list[dict]:
-        """Get OpenAI-format tool schemas for the specified MCP servers."""
+        """Get OpenAI-format tool schemas for the specified MCP servers (filtered by tool permissions)."""
         result = []
         for server_name in mcp_servers:
             client = self._clients.get(server_name)
@@ -406,6 +659,10 @@ class MCPManager:
             for prefixed_name in client._registered_names:
                 tool = tool_registry.get_tool(prefixed_name)
                 if tool and tool.get("max_frequency", 0) > 0:
+                    # Check tool-level permission
+                    original_name = prefixed_name.removeprefix(f"mcp_{server_name}_")
+                    if not self.is_tool_enabled(server_name, original_name):
+                        continue
                     result.append({
                         "type": "function",
                         "function": {
@@ -468,7 +725,6 @@ class MCPManager:
 
 # ── SDK MCP Server（进程内 MCP）──────────────────────────
 
-from dataclasses import dataclass
 from typing import Callable, Awaitable
 
 

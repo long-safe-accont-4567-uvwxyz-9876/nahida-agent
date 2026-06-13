@@ -11,6 +11,7 @@ const navItems = [
   { icon: 'models', label: '模型与凭证', route: '/settings/models' },
   { icon: 'tools', label: 'Skills 工具', route: '/settings/tools' },
   { icon: 'mcp', label: 'MCP 服务', route: '/settings/mcp' },
+  { icon: 'plugins', label: '插件管理', route: '/settings/plugins' },
   { icon: 'insight', label: '内在世界', route: '/insight' },
   { icon: 'schedule', label: '定时与问候', route: '/schedule' },
   { icon: 'media', label: '媒体工坊', route: '/media' },

@@ -94,6 +94,23 @@ async def lifespan(app: FastAPI):
     apply_tool_overrides()
     await _start_user_mcp_servers(core)
 
+    # Initialize Plugin Manager
+    from plugins.manager import PluginManager
+    plugin_manager = PluginManager(
+        tool_registry=None,
+        hook_engine=core._hook_engine if hasattr(core, "_hook_engine") else None,
+        memory_manager=core.memory if hasattr(core, "memory") else None,
+        knowledge_graph=core.kg if hasattr(core, "kg") else None,
+        mcp_manager=core._mcp_manager,
+        agent_core=core,
+    )
+    # Set tool_registry reference
+    import tool_registry as _tool_registry_mod
+    plugin_manager._tool_registry = _tool_registry_mod
+    # Discover plugins
+    plugin_manager.discover()
+    app.state.plugin_manager = plugin_manager
+
     queue = MediaTaskQueue(core, manager.broadcast)
     queue.start()
     app.state.media_queue = queue
@@ -124,6 +141,13 @@ async def lifespan(app: FastAPI):
             await qq_task
         except (asyncio.CancelledError, Exception):
             pass
+    # Shutdown plugins
+    plugin_mgr = getattr(app.state, "plugin_manager", None)
+    if plugin_mgr:
+        try:
+            await plugin_mgr.shutdown_all()
+        except Exception:
+            pass
     await scheduler.stop()
     await queue.stop()
     if owns_core:
@@ -147,10 +171,11 @@ def create_app() -> FastAPI:
     from web.routers.schedule import router as schedule_router
     from web.routers.media import router as media_router
     from web.routers.health import router as health_router
+    from web.routers.plugins import router as plugins_router
 
     for r in (auth_router, chat_router, system_router, agents_router,
               models_router, tools_router, mcp_router, insight_router,
-              schedule_router, media_router, health_router):
+              schedule_router, media_router, health_router, plugins_router):
         app.include_router(r, prefix="/api/v1")
 
     from web.ws_hub import router as ws_router

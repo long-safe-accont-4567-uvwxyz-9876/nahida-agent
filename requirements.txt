@@ -27,6 +27,7 @@ openai>=2.41.0
 aiosqlite>=0.22.1
 pydantic>=2.13.4
 jieba>=0.42.1
+pyyaml>=6.0
 
 # ── QQ Bot ──
 qq-botpy>=1.2.1

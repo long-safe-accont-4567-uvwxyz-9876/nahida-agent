@@ -35,7 +35,10 @@ def register_tool(name: str, description: str, schema: dict,
                   permission: ToolPermission = ToolPermission.READ_ONLY,
                   category: str = "general",
                   max_frequency: int = 10,
-                  requires_confirmation: bool = False):
+                  requires_confirmation: bool = False,
+                  source: str = "builtin",
+                  plugin_id: str = "",
+                  version: str = ""):
     def decorator(func):
         global _schema_cache, _schema_version
         _tools[name] = {
@@ -47,7 +50,9 @@ def register_tool(name: str, description: str, schema: dict,
             "max_frequency": max_frequency,
             "requires_confirmation": requires_confirmation,
             "func": func,
-            "source": "builtin",
+            "source": source,
+            "plugin_id": plugin_id,
+            "version": version,
         }
         _schema_version += 1
         _schema_cache = None
@@ -57,7 +62,10 @@ def register_tool(name: str, description: str, schema: dict,
 
 def register_tool_direct(name: str, description: str, func: callable,
                          parameters: dict, permission: ToolPermission = ToolPermission.READ_ONLY,
-                         category: str = "general"):
+                         category: str = "general",
+                         source: str = "dynamic",
+                         plugin_id: str = "",
+                         version: str = ""):
     """直接注册工具（非装饰器模式），用于程序化注册"""
     global _schema_cache, _schema_version
     _tools[name] = {
@@ -72,7 +80,9 @@ def register_tool_direct(name: str, description: str, func: callable,
         "max_frequency": 10,
         "requires_confirmation": False,
         "func": func,
-        "source": "dynamic",
+        "source": source,
+        "plugin_id": plugin_id,
+        "version": version,
     }
     _schema_version += 1
     _schema_cache = None
@@ -142,3 +152,15 @@ def unregister_tool(name: str) -> bool:
         _schema_cache = None
         return True
     return False
+
+
+def unregister_by_plugin(plugin_id: str) -> list[str]:
+    """移除指定插件注册的所有工具，返回被移除的工具名列表"""
+    global _schema_cache, _schema_version
+    removed = [name for name, t in _tools.items() if t.get("plugin_id") == plugin_id]
+    for name in removed:
+        del _tools[name]
+    if removed:
+        _schema_version += 1
+        _schema_cache = None
+    return removed

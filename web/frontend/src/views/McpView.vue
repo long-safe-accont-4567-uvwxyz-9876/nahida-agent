@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import {
   NButton, NModal, NForm, NFormItem, NInput, NTag, NPopconfirm,
-  NDynamicInput, useMessage,
+  NDynamicInput, NSwitch, NSpace, useMessage,
 } from 'naive-ui'
 import { get, post, put, del } from '../api'
 
@@ -150,6 +150,64 @@ async function remove(name: string) {
 }
 
 const statusType: Record<string, any> = { running: 'success', stopped: 'default', error: 'error' }
+
+// ── 模板功能 ──────────────────────────────────────────────
+const showTemplates = ref(false)
+const TEMPLATES = [
+  { name: 'filesystem', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', '/path/to/dir'], desc: '文件系统读写' },
+  { name: 'fetch', command: 'npx', args: ['-y', '@modelcontextprotocol/server-fetch'], desc: 'HTTP 请求抓取网页' },
+  { name: 'memory', command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'], desc: '知识图谱记忆' },
+  { name: 'brave-search', command: 'npx', args: ['-y', '@modelcontextprotocol/server-brave-search'], desc: 'Brave 搜索（需 BRAVE_API_KEY）', env: { BRAVE_API_KEY: '' } },
+  { name: 'sqlite', command: 'uvx', args: ['mcp-server-sqlite', '--db-path', '/path/to/db.sqlite'], desc: 'SQLite 数据库' },
+  { name: 'github', command: 'npx', args: ['-y', '@modelcontextprotocol/server-github'], desc: 'GitHub 操作（需 GITHUB_TOKEN）', env: { GITHUB_TOKEN: '' } },
+]
+
+async function applyTemplate(tpl: typeof TEMPLATES[number]) {
+  try {
+    await post('/mcp/servers', {
+      name: tpl.name,
+      command: tpl.command,
+      args: tpl.args,
+      env: tpl.env || {},
+    })
+    message.success(`模板「${tpl.name}」已创建并启动 ✓`)
+    showTemplates.value = false
+    await load()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
+
+// ── 健康检查 ──────────────────────────────────────────────
+const healthMap = ref<Record<string, string>>({})
+
+async function checkHealth(name: string) {
+  try {
+    const res = await get<any>(`/mcp/servers/${name}/health`)
+    healthMap.value[name] = res.status || 'healthy'
+  } catch {
+    healthMap.value[name] = 'unhealthy'
+  }
+}
+
+function healthDotColor(name: string, serverStatus: string) {
+  if (serverStatus !== 'running') return 'var(--moon-dim)'
+  const h = healthMap.value[name]
+  if (h === 'healthy') return '#7fd650'
+  if (h === 'unhealthy') return '#d96a5f'
+  return '#e8d5a3' // unknown
+}
+
+// ── 工具级开关 ──────────────────────────────────────────────
+async function toggleTool(serverName: string, toolName: string, enabled: boolean) {
+  try {
+    await put(`/mcp/servers/${serverName}/tools/${toolName}`, { enabled })
+    message.success(`${toolName} 已${enabled ? '启用' : '禁用'} ✓`)
+    await load()
+  } catch (e: any) {
+    message.error(e.message)
+  }
+}
 </script>
 
 <template>
@@ -157,6 +215,7 @@ const statusType: Record<string, any> = { running: 'success', stopped: 'default'
     <div class="view-header">
       <h2>🔌 MCP 服务</h2>
       <div style="display:flex; gap:8px">
+        <n-button @click="showTemplates = true">📦 模板</n-button>
         <n-button type="primary" @click="showImport = true">📋 粘贴 JSON 导入</n-button>
         <n-button @click="openForm(null)">＋ 手动新增</n-button>
       </div>
@@ -169,13 +228,23 @@ const statusType: Record<string, any> = { running: 'success', stopped: 'default'
     <div class="server-grid">
       <div v-for="s in servers" :key="s.name" class="server-card glass-panel glass-panel-hover">
         <div class="server-head">
-          <span class="server-name">{{ s.name }}</span>
+          <n-space align="center" :size="6">
+            <span class="health-dot"
+                  :style="{ background: healthDotColor(s.name, s.status) }"
+                  :title="s.status === 'running' ? (healthMap[s.name] || '未检查') : s.status"
+                  @click="s.status === 'running' && checkHealth(s.name)"></span>
+            <span class="server-name">{{ s.name }}</span>
+          </n-space>
           <n-tag size="small" :type="statusType[s.status]" :bordered="false">{{ s.status }}</n-tag>
         </div>
         <div class="server-cmd mono">{{ s.command }} {{ (s.args || []).join(' ') }}</div>
         <div v-if="s.last_error" class="server-error">{{ s.last_error }}</div>
         <div class="server-tools">
-          <n-tag v-for="t in (s.tool_names || []).slice(0, 8)" :key="t" size="tiny" :bordered="false">{{ t }}</n-tag>
+          <div v-for="t in (s.tool_names || []).slice(0, 8)" :key="t" class="tool-toggle">
+            <n-switch size="small" :value="!(s.disabled_tools || []).includes(t)"
+                      @update:value="(v: boolean) => toggleTool(s.name, t, v)" />
+            <n-tag size="tiny" :bordered="false" :type="(s.disabled_tools || []).includes(t) ? 'default' : 'success'">{{ t }}</n-tag>
+          </div>
           <span v-if="(s.tool_names || []).length > 8" class="more">
             +{{ s.tool_names.length - 8 }}
           </span>
@@ -238,6 +307,23 @@ const statusType: Record<string, any> = { running: 'success', stopped: 'default'
         </div>
       </template>
     </n-modal>
+
+    <n-modal v-model:show="showTemplates" preset="card" title="📦 MCP Server 模板"
+             style="width: min(580px, 94vw)">
+      <p style="font-size:13px; color:var(--moon-dim); margin-bottom:12px">
+        选择预设模板，一键创建并启动 MCP Server。部分模板需要配置环境变量。
+      </p>
+      <div class="template-list">
+        <div v-for="tpl in TEMPLATES" :key="tpl.name" class="template-item glass-panel">
+          <div class="tpl-info">
+            <span class="tpl-name">{{ tpl.name }}</span>
+            <span class="tpl-desc">{{ tpl.desc }}</span>
+            <span class="tpl-cmd mono">{{ tpl.command }} {{ tpl.args.join(' ') }}</span>
+          </div>
+          <n-button size="tiny" type="primary" @click="applyTemplate(tpl)">一键创建</n-button>
+        </div>
+      </div>
+    </n-modal>
   </div>
 </template>
 
@@ -268,8 +354,24 @@ const statusType: Record<string, any> = { running: 'success', stopped: 'default'
   border-radius: 6px; padding: 4px 8px; margin-bottom: 8px;
 }
 
-.server-tools { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; min-height: 22px; }
+.server-tools { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; min-height: 22px; align-items: center; }
+.tool-toggle { display: flex; align-items: center; gap: 3px; }
 .more { font-size: 11px; color: var(--moon-dim); }
+
+.health-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  cursor: pointer; transition: background 0.2s;
+}
+
+.template-list { display: flex; flex-direction: column; gap: 10px; }
+.template-item {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; gap: 12px;
+}
+.tpl-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tpl-name { font-weight: 600; font-size: 14px; }
+.tpl-desc { font-size: 12px; color: var(--moon-dim); }
+.tpl-cmd { font-size: 11px; color: var(--moon-dim); word-break: break-all; }
 
 .server-ops { display: flex; gap: 6px; flex-wrap: wrap; }
 

@@ -5,6 +5,7 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
+from pydantic import BaseModel
 
 from web.schemas import Envelope
 from web.routers.auth import get_current_user
@@ -208,3 +209,83 @@ async def server_tools(name: str, request: Request):
     if not client:
         raise HTTPException(404, f"MCP server {name} 不存在")
     return Envelope(data=sorted(client.tool_names))
+
+
+# ── MCP Templates ──
+
+MCP_TEMPLATES = [
+    {
+        "name": "filesystem",
+        "description": "文件系统访问",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"],
+    },
+    {
+        "name": "github",
+        "description": "GitHub API",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env_vars": ["GITHUB_PERSONAL_ACCESS_TOKEN"],
+    },
+    {
+        "name": "brave-search",
+        "description": "Brave 搜索",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+        "env_vars": ["BRAVE_API_KEY"],
+    },
+    {
+        "name": "sqlite",
+        "description": "SQLite 数据库",
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["mcp-server-sqlite", "--db-path", "/path/to/db"],
+    },
+    {
+        "name": "fetch",
+        "description": "HTTP 请求",
+        "transport": "stdio",
+        "command": "uvx",
+        "args": ["mcp-server-fetch"],
+    },
+]
+
+
+@router.get("/mcp/templates", response_model=Envelope[list[dict]])
+async def get_mcp_templates():
+    """获取 MCP 服务器模板列表"""
+    return Envelope(data=MCP_TEMPLATES)
+
+
+# ── MCP Health ──
+
+@router.get("/mcp/servers/{server_name}/health", response_model=Envelope[dict])
+async def get_mcp_health(server_name: str, request: Request):
+    """获取 MCP 服务器健康状态"""
+    mgr = _manager(request)
+    client = mgr._clients.get(server_name)
+    if not client:
+        raise HTTPException(404, f"Server '{server_name}' not found")
+    return Envelope(data={
+        "server": server_name,
+        "connected": client._connected,
+        "available": client.available,
+        "transport": client._config.transport if hasattr(client, "_config") else "stdio",
+    })
+
+
+# ── Tool-level Permissions ──
+
+class ToolEnabledRequest(BaseModel):
+    enabled: bool
+
+
+@router.put("/mcp/servers/{server_name}/tools/{tool_name}/enabled", response_model=Envelope[dict])
+async def set_tool_enabled(server_name: str, tool_name: str, req: ToolEnabledRequest, request: Request):
+    """设置工具级启用/禁用"""
+    mgr = _manager(request)
+    mgr.set_tool_enabled(server_name, tool_name, req.enabled)
+    return Envelope(data={"status": "ok", "server": server_name, "tool": tool_name, "enabled": req.enabled})

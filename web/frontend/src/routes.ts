@@ -20,6 +20,7 @@ export const routes: RouteRecordRaw[] = [
       { path: 'settings/models', name: 'models', component: () => import('./views/ModelsView.vue') },
       { path: 'settings/tools', name: 'tools', component: () => import('./views/ToolsView.vue') },
       { path: 'settings/mcp', name: 'mcp', component: () => import('./views/McpView.vue') },
+      { path: 'settings/plugins', name: 'plugins', component: () => import('./views/PluginsView.vue') },
       { path: 'settings/system', name: 'settings', component: () => import('./views/SettingsView.vue') },
     ],
   },
