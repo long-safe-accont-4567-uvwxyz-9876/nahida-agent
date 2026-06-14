@@ -28,7 +28,7 @@ class ResultWrapper:
         self.router = router
 
     async def wrap(self, tool_name: str, result, user_context: str = "") -> str:
-        from tool_registry import ToolResult
+        from tool_engine.tool_registry import ToolResult
 
         if isinstance(result, ToolResult):
             if not result.success:

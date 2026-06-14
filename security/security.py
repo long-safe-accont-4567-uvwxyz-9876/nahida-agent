@@ -15,7 +15,7 @@ class SecurityCheckResult:
 
 def _is_dev_mode() -> bool:
     """检查是否处于开发板模式 — 已弃用，请使用 PermissionManager"""
-    from permission_manager import get_permission_manager
+    from .permission_manager import get_permission_manager
     return get_permission_manager().is_dev_mode()
 
 
@@ -144,7 +144,7 @@ class SecurityFilter:
 
     def _decide_action(self, threat_type: str, confidence: float) -> str:
         """根据威胁类型和置信度决定动作，使用 PermissionManager"""
-        from permission_manager import get_permission_manager
+        from .permission_manager import get_permission_manager
         return get_permission_manager().decide_security_action(threat_type, confidence)
 
     def check_user_input(self, text: str) -> SecurityCheckResult:

@@ -99,7 +99,7 @@ class SmartErrorHandler:
         
         if class_name == "DatabaseManager":
             for attr, db_class in db_manager_attrs.items():
-                if missing_attr in dir(__import__(f'db_{attr}', fromlist=[attr])):
+                if missing_attr in dir(__import__(f'db.db_{attr}', fromlist=[attr])):
                     return f"应该通过 self._db.{attr}.{missing_attr}() 调用，而不是 self._db.{missing_attr}()"
         
         return f"检查 {class_name} 类是否定义了 {missing_attr} 方法或属性"

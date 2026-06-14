@@ -4,8 +4,8 @@ import time
 import inspect
 from loguru import logger
 
-from tool_registry import get_tool, ToolPermission, ToolResult
-from metrics import metrics
+from .tool_registry import get_tool, ToolPermission, ToolResult
+from utils.metrics import metrics
 
 # 敏感参数关键词，匹配到的参数值会被屏蔽
 _SENSITIVE_KEYS = {'key', 'token', 'password', 'secret', 'api_key', 'credential'}

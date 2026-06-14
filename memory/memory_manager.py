@@ -3,10 +3,10 @@ import re
 import time
 from loguru import logger
 
-from database import DatabaseManager
-from db_memory import MemoryDB
-from vector_store import VectorStore
-from atomic_write import atomic_json_write
+from db.database import DatabaseManager
+from db.db_memory import MemoryDB
+from .vector_store import VectorStore
+from utils.atomic_write import atomic_json_write
 
 
 def _extract_entities(text: str) -> list[str]:
@@ -298,7 +298,7 @@ class MemoryManager:
             return
 
         # 原有安全扫描（保留兼容）
-        from security import SecurityFilter
+        from security.security import SecurityFilter
         security = self._security_filter or SecurityFilter()
         threat_result = security.scan_threats(summary, scope="strict")
         if not threat_result.is_safe and threat_result.action == "block":

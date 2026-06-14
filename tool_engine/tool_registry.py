@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from enum import Enum
 
-from metrics import metrics
+from utils.metrics import metrics
 
 
 class ToolPermission(Enum):

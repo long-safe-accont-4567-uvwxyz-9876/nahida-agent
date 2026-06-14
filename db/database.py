@@ -6,12 +6,12 @@ import aiosqlite
 from pathlib import Path
 from loguru import logger
 from config import DATA_DIR
-from db_memory import MemoryDB
-from db_notebook import NotebookDB
-from db_learning import LearningDB
-from db_knowledge import KnowledgeDB
-from db_analytics import AnalyticsDB
-from session_store import (
+from .db_memory import MemoryDB
+from .db_notebook import NotebookDB
+from .db_learning import LearningDB
+from .db_knowledge import KnowledgeDB
+from .db_analytics import AnalyticsDB
+from .session_store import (
     SessionInfo,
     SessionSummaryEntry,
     SessionStoreProtocol,
@@ -99,7 +99,7 @@ class DatabaseManager:
                 # 回填已有记忆数据到 FTS 索引
                 rows = await self._conn.execute_fetchall("SELECT id, summary FROM episodic_memories")
                 for row in rows:
-                    from memory_manager import _tokenize_for_fts
+                    from memory.memory_manager import _tokenize_for_fts
                     tokenized = _tokenize_for_fts(row[1])
                     if tokenized.strip():
                         await self._conn.execute(

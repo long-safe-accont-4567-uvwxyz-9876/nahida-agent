@@ -5,7 +5,7 @@ import time
 import datetime
 from loguru import logger
 
-from db_notebook import NotebookDB
+from db.db_notebook import NotebookDB
 
 
 AUTO_NOTE_PROMPT = """你是纳西妲。刚刚和爸爸进行了一轮对话。

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from loguru import logger
 
-from db_analytics import AnalyticsDB
+from db.db_analytics import AnalyticsDB
 
 
 class NudgeEngine:
@@ -224,7 +224,7 @@ class NudgeEngine:
         self._last_promote_check = now
         try:
             if hasattr(self._db, 'learning') and hasattr(self._db, '_conn'):
-                from learning_manager import LearningManager
+                from memory.learning_manager import LearningManager
                 lm = LearningManager(self._db, self._db.learning, self._router)
                 await lm.auto_promote()
         except Exception as e:

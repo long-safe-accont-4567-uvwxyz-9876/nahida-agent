@@ -6,7 +6,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
-from tool_registry import ToolResult
+from tool_engine.tool_registry import ToolResult
 
 logger = logging.getLogger("vision_service")
 
@@ -99,21 +99,21 @@ class VisionService:
             return
         if os.getenv("ENABLE_NPU", "").lower() in ("1", "true", "yes"):
             try:
-                from npu_inference import NPUInference
+                from .npu_inference import NPUInference
                 if NPUInference.is_available():
                     model_path = str(MODELS_DIR / "yolov5.nb")
                     if os.path.exists(model_path):
                         self._npu = NPUInference(model_path=model_path)
                         self.model_loaded = True
                         self.backend = "npu"
-                        logger.info("vision.npu_loaded", model=model_path)
+                        logger.info(f"vision.npu_loaded model={model_path}")
                         return
                     else:
-                        logger.warning("vision.npu_model_not_found", path=model_path)
+                        logger.warning(f"vision.npu_model_not_found path={model_path}")
                 else:
                     logger.warning("vision.npu_not_available")
             except Exception as e:
-                logger.warning("vision.npu_init_failed", error=str(e))
+                logger.warning(f"vision.npu_init_failed error={e}")
         try:
             import ncnn
         except ImportError:
@@ -250,7 +250,7 @@ class VisionService:
                         valid_results.append(r)
                 return valid_results
             except Exception as e:
-                logger.warning("vision.npu_detect_failed", error=str(e))
+                logger.warning(f"vision.npu_detect_failed error={e}")
                 return []
         if self.backend == "ncnn":
             return self._detect_ncnn(frame)

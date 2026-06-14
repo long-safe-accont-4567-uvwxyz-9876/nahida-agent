@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from loguru import logger
 from config import DATA_DIR
-from atomic_write import atomic_write
+from utils.atomic_write import atomic_write
 
 SUMMARY_PREFIX = (
     "[上下文压缩 — 仅供参考] 之前的对话已被压缩为以下摘要。"
@@ -251,7 +251,7 @@ def get_context_compressor(router=None) -> ContextCompressor:
 
 
 # 注册为工具
-from tool_registry import register_tool, ToolPermission, ToolResult
+from tool_engine.tool_registry import register_tool, ToolPermission, ToolResult
 
 @register_tool(
     name="retrieve_context",

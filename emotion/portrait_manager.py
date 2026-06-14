@@ -3,7 +3,7 @@ import re
 import time
 from loguru import logger
 
-from db_memory import MemoryDB
+from db.db_memory import MemoryDB
 
 
 def _repair_and_extract_json(raw: str) -> dict | None:

@@ -2,7 +2,7 @@ import re
 import random
 from pathlib import Path
 from loguru import logger
-from emotion_enum import Emotion, resolve_emotion, STICKER_FALLBACK, is_unified
+from .emotion_enum import Emotion, resolve_emotion, STICKER_FALLBACK, is_unified
 
 
 class StickerManager:
@@ -168,7 +168,7 @@ class StickerManager:
         if is_unified():
             # 统一模式：用 emotion_simple 检测 → resolve_emotion → STICKER_FALLBACK
             try:
-                from emotion_simple import detect_emotion as _detect
+                from .emotion_simple import detect_emotion as _detect
                 result = _detect(text)
                 cn_label = result.get("primary", "平静") if isinstance(result, dict) else str(result)
                 emotion = resolve_emotion(cn_label)

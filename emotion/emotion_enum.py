@@ -147,7 +147,7 @@ def ensure_emotion_tag(text: str) -> tuple[str, Emotion]:
 
     # 无标签：用 emotion_simple 推断
     try:
-        from emotion_simple import detect_emotion
+        from .emotion_simple import detect_emotion
         cn_label = detect_emotion(text)
         if isinstance(cn_label, dict):
             cn_label = cn_label.get("primary", "平静")

@@ -26,7 +26,7 @@ class MemoryDB:
             await self._conn.commit()
         # 同步写入 FTS 索引
         try:
-            from memory_manager import _tokenize_for_fts
+            from memory.memory_manager import _tokenize_for_fts
             tokenized = _tokenize_for_fts(summary)
             if tokenized.strip():
                 await self._conn.execute(
@@ -68,7 +68,7 @@ class MemoryDB:
 
     async def search_memories_fts(self, query: str, limit: int = 10) -> list[dict]:
         """FTS5 BM25 全文检索"""
-        from memory_manager import _build_fts_query
+        from memory.memory_manager import _build_fts_query
         fts_query = _build_fts_query(query)
         if not fts_query:
             return []

@@ -12,8 +12,8 @@ from typing import Any
 
 from loguru import logger
 
-import tool_registry
-from tool_registry import ToolPermission, ToolResult
+import tool_engine.tool_registry as _tool_registry_mod
+from .tool_registry import ToolPermission, ToolResult
 
 
 @dataclass
@@ -240,7 +240,7 @@ class MCPClient:
 
         # Unregister tools from tool_registry (使用公共 API)
         for name in self._registered_names:
-            tool_registry.unregister_tool(name)
+            _tool_registry_mod.unregister_tool(name)
         self._registered_names.clear()
         self._tool_names.clear()
 
@@ -426,7 +426,7 @@ class MCPClient:
         _mcp_client_ref = self
 
         # Register via the decorator pattern: register_tool returns a decorator
-        tool_registry.register_tool(
+        _tool_registry_mod.register_tool(
             name=prefixed_name,
             description=description,
             schema=input_schema,
@@ -541,7 +541,7 @@ class MCPManager:
             server = self._sdk_servers.pop(name)
             for tool in server.tools.values():
                 full_name = f"sdk_{name}_{tool.name}"
-                from tool_registry import unregister_tool
+                from .tool_registry import unregister_tool
                 unregister_tool(full_name)
 
     # ── health monitoring ────────────────────────────────────────
@@ -657,7 +657,7 @@ class MCPManager:
             if not client or not client.available:
                 continue
             for prefixed_name in client._registered_names:
-                tool = tool_registry.get_tool(prefixed_name)
+                tool = _tool_registry_mod.get_tool(prefixed_name)
                 if tool and tool.get("max_frequency", 0) > 0:
                     # Check tool-level permission
                     original_name = prefixed_name.removeprefix(f"mcp_{server_name}_")
@@ -684,7 +684,7 @@ class MCPManager:
         """注册进程内 SDK MCP 服务器"""
         self._sdk_servers[server.name] = server
         # 注册工具到 tool_registry
-        from tool_registry import register_tool_direct
+        from .tool_registry import register_tool_direct
         for tool in server.tools.values():
             full_name = f"sdk_{server.name}_{tool.name}"
             register_tool_direct(
@@ -703,10 +703,10 @@ class MCPManager:
         async def wrapper(**kwargs):
             server = self._sdk_servers.get(server_name)
             if not server:
-                from tool_registry import ToolResult
+                from .tool_registry import ToolResult
                 return ToolResult.fail(f"SDK MCP 服务器 '{server_name}' 未注册")
             result = await server.call_tool(tool_name, kwargs)
-            from tool_registry import ToolResult
+            from .tool_registry import ToolResult
             if "error" in result:
                 return ToolResult.fail(result["error"])
             # 提取文本内容

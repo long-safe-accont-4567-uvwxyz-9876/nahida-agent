@@ -11,7 +11,7 @@ from enum import Enum
 from dataclasses import dataclass, field
 from loguru import logger
 
-from error_classifier import ClassifiedError, FailoverReason
+from .error_classifier import ClassifiedError, FailoverReason
 
 
 class CredentialState(Enum):

@@ -8,7 +8,7 @@ from collections import OrderedDict
 from pathlib import Path
 from openai import AsyncOpenAI
 from loguru import logger
-from emotion_enum import resolve_emotion, TTS_STYLE_MAP, is_unified
+from .emotion_enum import resolve_emotion, TTS_STYLE_MAP, is_unified
 
 MIMO_API_KEY = os.getenv("MIMO_API_KEY", "")
 MIMO_BASE_URL = os.getenv("MIMO_BASE_URL", "https://api.xiaomimimo.com/v1")

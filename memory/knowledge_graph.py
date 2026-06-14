@@ -3,7 +3,7 @@ import re
 import time
 from loguru import logger
 
-from db_knowledge import KnowledgeDB
+from db.db_knowledge import KnowledgeDB
 
 
 ENTITY_EXTRACT_PROMPT = """从以下对话摘要中提取关键实体和关系，只提取最显著的3-5个。

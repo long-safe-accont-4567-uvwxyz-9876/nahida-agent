@@ -1,7 +1,7 @@
 import time
 from loguru import logger
 
-from db_learning import LearningDB
+from db.db_learning import LearningDB
 
 
 CORRECTION_SIGNALS = ["不对", "错了", "不是这样的", "应该是", "你说错了",
@@ -88,7 +88,7 @@ class LearningManager:
                     break
 
             for result in tool_results:
-                from tool_registry import ToolResult
+                from tool_engine.tool_registry import ToolResult
                 if isinstance(result, ToolResult) and not result.success:
                     await self.log_error(
                         error_text=result.error,
