@@ -562,8 +562,8 @@ class AgentCore:
         try:
             from web.tool_events import emit_tool_event
             await emit_tool_event("start", tool_name, actual_args)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"WebUI工具事件(start)发送失败，非关键: {e}")
 
         # 工具护栏检查
         from tool_engine.tool_guardrails import get_tool_guardrails
@@ -579,8 +579,8 @@ class AgentCore:
             from web.tool_events import emit_tool_event
             await emit_tool_event("end", tool_name, ok=result.success,
                                   elapsed_ms=int((_time.time() - _tool_t0) * 1000))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"WebUI工具事件(end)发送失败，非关键: {e}")
 
         # 记录工具调用到护栏
         await guardrails.record_call(tool_name, arguments, result.success,

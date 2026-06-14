@@ -383,6 +383,9 @@ class TestSubAgentSticker:
                     synthesize=AsyncMock(return_value=None),
                 )
                 core.dispatcher.dispatch = AsyncMock(return_value="开心地回复")
+                # context.add_message 是 async 方法，必须用 AsyncMock
+                core.context = MagicMock()
+                core.context.add_message = AsyncMock(return_value=None)
                 # BackgroundTaskManager mock（架构拆分后必需）
                 core._bg_task_manager = MagicMock()
                 core._bg_task_manager.run_background_tasks = MagicMock()
