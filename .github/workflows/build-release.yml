@@ -15,15 +15,9 @@ jobs:
           - runner: windows-latest
             platform: windows-x64
             artifact: nahida-agent-windows-x64
-            is_self_hosted: false
           - runner: ubuntu-latest
             platform: linux-x86_64
             artifact: nahida-agent-linux-x86_64
-            is_self_hosted: false
-          - runner: self-hosted,aarch64
-            platform: linux-aarch64
-            artifact: nahida-agent-linux-aarch64
-            is_self_hosted: true
 
     runs-on: ${{ matrix.runner }}
 
@@ -32,16 +26,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Python 3.11
-        if: ${{ !matrix.is_self_hosted }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        if: ${{ !matrix.is_self_hosted }}
         run: |
           pip install pyinstaller
-          pip install -r requirements.txt || pip install -r requirements.txt --no-binary :all: 2>/dev/null || true
+          pip install -r requirements.txt || true
           # Ensure core deps are installed even if optional ones fail
           pip install fastapi uvicorn[standard] websockets python-multipart sse-starlette httpx Pillow numpy rich python-dotenv loguru openai aiosqlite pydantic jieba pyyaml
 
@@ -69,12 +61,6 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           tar -czf nahida-agent-linux-x86_64-v${VERSION}.tar.gz -C dist nahida-agent
 
-      - name: Package (Linux aarch64)
-        if: matrix.platform == 'linux-aarch64'
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          tar -czf nahida-agent-linux-aarch64-v${VERSION}.tar.gz -C dist nahida-agent
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -82,7 +68,6 @@ jobs:
           path: |
             nahida-agent-windows-x64-*.zip
             nahida-agent-linux-x86_64-*.tar.gz
-            nahida-agent-linux-aarch64-*.tar.gz
           if-no-files-found: error
 
   release:
@@ -109,4 +94,3 @@ jobs:
           files: |
             artifacts/nahida-agent-windows-x64-*.zip
             artifacts/nahida-agent-linux-x86_64-*.tar.gz
-            artifacts/nahida-agent-linux-aarch64-*.tar.gz
