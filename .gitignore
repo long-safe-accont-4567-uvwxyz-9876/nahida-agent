@@ -21,3 +21,4 @@ data/
 web/dist/
 web/frontend/tsconfig.tsbuildinfo
 tests/benchmark_results.json
+*.log
